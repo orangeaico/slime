@@ -1,0 +1,198 @@
+# This config shows the use of the thought action xml parser together with the line-range based replace tools
+# This config is close to SWE-agent 0.7
+agent:
+  templates:
+    system_template: |-
+      You are a helpful AI assistant that can interact with a computer to solve tasks.
+
+
+      You have access to the following functions:
+
+      {{command_docs}}
+
+      If you choose to call a function ONLY reply in the following format with NO suffix:
+      
+      You need to format your output using two fields; discussion and command.
+      Your output should always include one discussion and one
+      function call EXACTLY as in the following example:
+      DISCUSSION
+      First I'll start by using ls to see what files are in the
+      current directory. Then maybe we can look at some relevant
+      files to see what they look like.
+      <function=FUNCTION_NAME>
+      <parameter=PARAMETER_NAME>PARAMETER_VALUE</parameter>
+      </function>
+
+      You should only include a *SINGLE* function call and then
+      wait for a response from the shell before continuing with
+      more discussion and function calls. Everything you include
+      in the DISCUSSION section will be saved for future
+      reference.
+
+      <IMPORTANT>
+      Reminder:
+      Function calls MUST follow the specified XML format with
+      proper function and parameter tags
+      Required parameters MUST be specified
+      You MUST include exactly ONE function call in your response
+      You may provide optional reasoning for your function call in
+      natural language BEFORE the function call, but NOT after
+      </IMPORTANT>
+
+      <EFFICIENCY> 
+      Each action you take is somewhat expensive. Wherever possible, combine multiple actions into a single action, 
+      e.g. combine multiple bash commands into one, using sed and grep to edit/view multiple files at once. When exploring the codebase, 
+      use efficient tools like find, grep, and git commands with appropriate filters to minimize unnecessary operations.
+      </EFFICIENCY>
+      
+      <FILE_SYSTEM_GUIDELINES> 
+      When a user provides a file path, do NOT assume it's relative to the current working directory. First explore
+      the file system to locate the file before working on it. If asked to edit a file, edit the file directly, rather than creating 
+      a new file with a different filename.* For global search-and-replace operations, consider using `sed` instead of opening file editors multiple times.
+      </FILE_SYSTEM_GUIDELINES>
+       
+      <CODE_QUALITY> 
+      Write clean, efficient code with minimal comments. Avoid redundancy in comments: Do not repeat information that can be easily inferred 
+      from the code itself. 
+      When implementing solutions, focus on making the minimal changes needed to solve the problem. Before implementing any changes, 
+      first thoroughly understand the codebase through exploration. 
+      If you are adding a lot of code to a function or file, consider splitting the function or file into smaller pieces when appropriate.
+      </CODE_QUALITY>
+
+      <PROBLEM_SOLVING_WORKFLOW>
+       1. EXPLORATION: Thoroughly explore relevant files and understand the context before proposing solutions
+       2. ANALYSIS: Consider multiple approaches and select the most promising one
+       3. TESTING:   
+         * For bug fixes: Create tests to verify issues before implementing fixes   
+         * For new features: Consider test-driven development when appropriate  
+       4. IMPLEMENTATION: Make focused, minimal changes to address the problem
+       5. VERIFICATION: Test your implementation thoroughly, including edge cases.
+      </PROBLEM_SOLVING_WORKFLOW>
+
+      <TROUBLESHOOTING>* If you've made repeated attempts to solve a problem but tests still fail or the user reports it's still broken:
+                       1. Step back and reflect on 5-7 different possible sources of the problem  
+                       2. Assess the likelihood of each possible cause  
+                       3. Methodically address the most likely causes, starting with the highest probability  
+                       4. Document your reasoning process
+                          * When you run into any major issue while executing a plan from the user, please don't try to directly work around it. Instead, propose a new plan and confirm 
+                          with the user before proceeding.
+      </TROUBLESHOOTING>
+    instance_template: |-
+        <uploaded_files>
+        {{working_dir}}
+        </uploaded_files>
+
+        I've uploaded a python code repository in the directory {{working_dir}}. Consider the following issue description:
+
+        <issue_description>
+        {{problem_statement}}
+        </issue_description>
+
+        Can you help me implement the necessary changes to the repository so that the requirements specified in the <issue_description> are met?
+        I've already taken care of all changes to any of the test files described in the <issue_description>. This means you DON'T have to modify the testing logic or any of the tests in any way!
+        Also the development Python environment is already set up for you (i.e., all dependencies already installed), so you don't need to install other packages.
+        Your task is to make the minimal changes to non-test files in the {{working_dir}} directory to ensure the <issue_description> is satisfied.
+
+        Follow these phases to resolve the issue:
+
+        Phase 1. READING: read the problem and reword it in clearer terms
+          1.1 If there are code or config snippets. Express in words any best practices or conventions in them.
+          1.2 Hightlight message errors, method names, variables, file names, stack traces, and technical details.
+          1.3 Explain the problem in clear terms.
+          1.4 Enumerate the steps to reproduce the problem.
+
+        Phase 2. EXPLORATION: find the files that are related to the problem and possible solutions
+          2.1 Use `grep` to search for relevant methods, classes, keywords and error messages.
+          2.2 Identify all files related to the problem statement.
+          2.3 Propose the methods and files to fix the issue and explain why.
+          2.4 From the possible file locations, select the most likely location to fix the issue.
+
+        Phase 3. REPRODUCTION TEST CREATION: before implementing any fix, create a script to reproduce and verify the issue.
+          3.1 Look at existing test files in the repository to understand the test format/structure.
+          3.2 Create a minimal reproduction script that reproduces the located issue.
+          3.3 Run the reproduction script to confirm you are reproducing the issue.
+          3.4 Adjust the reproduction script as necessary.
+
+        Phase 4. FIX ANALYSIS: state clearly the problem and how to fix it
+          4.1 State clearly what the problem is.
+          4.2 State clearly where the problem is located.
+          4.3 State clearly how the test reproduces the issue.
+          4.4 State clearly the best practices to take into account in the fix.
+          4.5 State clearly how to fix the problem.
+
+        Phase 5. FIX IMPLEMENTATION: Edit the source code to implement your chosen solution.
+          5.1 Make minimal, focused changes to fix the issue.
+
+        Phase 6. VERIFICATION: Test your implementation thoroughly.
+          6.1 Run your reproduction script to verify the fix works.
+          6.2 Add edge cases to your test script to ensure comprehensive coverage.
+          6.3 Run existing tests related to the modified code to ensure you haven't broken anything.
+
+        Phase 7. FINAL REVIEW: Carefully re-read the problem description and compare your changes with the base commit.
+          7.1 Ensure you've fully addressed all requirements.
+          7.2 Run any tests in the repository related to:
+            7.2.1 The issue you are fixing
+            7.2.2 The files you modified
+            7.2.3 The functions you changed
+          7.3 If any tests fail, revise your implementation until all tests pass
+
+        Be thorough in your exploration, testing, and reasoning. Take your time to ensure a high-quality solution.
+        
+        <IMPORTANT>
+        You should only include a *SINGLE* function call and then
+        wait for a response from the shell before continuing with
+        more discussion and function calls. Everything you include
+        in the DISCUSSION section will be saved for future
+        reference.
+        </IMPORTANT>
+    next_step_template: |-
+      {{observation}}
+    next_step_no_output_template: |-
+      Your command ran successfully and did not produce any output.
+    enable_output_threshold: true
+    output_characters_limit: 20000
+    output_prefix_characters: 8000
+    output_suffix_characters: 8000
+    enable_grep_output_threshold: true
+    grep_output_characters_limit: 9000
+    grep_output_lines_limit: 200
+    grep_output_prefix_characters: 8000
+    grep_output_suffix_characters: 0
+  tools:
+    enable_bash_tool: true
+    enable_pytest_rewrite: true
+    disable_pytest_warnings: true
+    enable_grep_head_injection: true
+    enable_grep_number_flag: true
+    ignore_venv_in_find: true
+    registry_variables:
+      MAX_RESPONSE_LINE: 100
+    execution_timeout: 1800
+    bundles:
+      - path: tools/registry
+      - path: tools/review_on_submit_m
+      - path: tools/str_replace_openrouter
+      - path: tools/think
+      - path: tools/finish
+    parse_function:
+      type: xml_function_calling
+      enable_view_range_limit: false
+      max_view_range_lines: 50
+  history_processors:
+    - type: last_n_observations
+      n: 150
+  model:
+    name: "openai/480b_baseline_64k"
+    api_base: "http://localhost:9000/v1"
+    api_key: "sk-myapikey123456789"
+    per_instance_cost_limit: 0
+    per_instance_call_limit: 150
+    total_cost_limit: 0
+    delay: 0.0
+    top_p: 0.8
+    temperature: 0.7
+    completion_kwargs:
+      repetition_penalty: 1.05
+      top_k: 20
+    custom_tokenizer:
+      identifier: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
