@@ -230,7 +230,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     assert not args.partial_rollout, "Partial rollout is not supported for this function at the moment."
 
     state = GenerateState(args)
-    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    # Use chat completions API instead of plain generate
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/chat/completions"
 
     # Initialize SWE environment from metadata
     env = None
@@ -320,23 +321,32 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         sample.metadata["error"] = env_init_error
         # Don't return - continue with simple generation instead
 
-    # Build initial prompt using SWE-agent templates
+    # Build conversation messages using SWE-agent templates with proper roles
     # Extract metadata for template formatting
-    working_dir = sample.metadata.get("repo", "unknown_repo").split("/")[-1]
+    working_dir = '/testbed'
     problem_statement = sample.prompt
 
-    # Format the system template (command docs would be filled by SWE-agent tools, we'll leave placeholder)
-    system_prompt = SWE_CONFIGS["system_template"].replace("{{command_docs}}",
-        "[Bash commands available - ls, cd, cat, grep, find, git, python, etc.]")
+    # Format the system template
+    system_prompt = SWE_CONFIGS["system_template"]
 
-    # Format the instance template
+    # Format the instance template (initial user message)
     instance_prompt = SWE_CONFIGS["instance_template"].replace("{{working_dir}}", working_dir)
     instance_prompt = instance_prompt.replace("{{problem_statement}}", problem_statement)
 
-    # Combine system and instance prompts
-    prompt_text = f"{system_prompt}\n\n{instance_prompt}"
+    # Initialize conversation with system and user messages
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": instance_prompt}
+    ]
 
-    # Tokenize prompt
+    # For tokenization and tracking, we need to reconstruct the full text
+    # Apply chat template to get the properly formatted prompt
+    prompt_text = state.tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False
+    )
     prompt_tokens_ids = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
 
     # Initialize response tracking
@@ -344,29 +354,71 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     response_token_ids = []
     loss_mask = []
 
+    # Track full conversation text for tokenization (includes prompt + all responses)
+    full_text = prompt_text
+
     try:
         for turn_idx in range(SWE_CONFIGS["max_turns"]):
-            # Generate model response
+            # Generate model response using chat completions API
+            # Extract model path from sglang (it's typically at the endpoint)
+            model_name = "/root/data/hf_models/Qwen3-1.7B"  # Default, should be same as teacher
+
+            # Build payload for OpenAI-compatible chat completions API
+            # sampling_params is a dict with keys like temperature, max_new_tokens, top_p, etc.
             payload = {
-                "text": prompt_text + response,
-                "sampling_params": sampling_params,
+                "model": model_name,
+                "messages": messages,
             }
+
+            # Add sampling parameters if they exist
+            if isinstance(sampling_params, dict):
+                if "temperature" in sampling_params:
+                    payload["temperature"] = float(sampling_params["temperature"])
+                if "max_new_tokens" in sampling_params:
+                    payload["max_tokens"] = int(sampling_params["max_new_tokens"])
+                if "top_p" in sampling_params:
+                    payload["top_p"] = float(sampling_params["top_p"])
+                if "top_k" in sampling_params:
+                    payload["top_k"] = int(sampling_params["top_k"])
+            else:
+                # Default values if sampling_params is not a dict
+                payload["temperature"] = 0.7
+                payload["max_tokens"] = 2048
+                payload["top_p"] = 1.0
+
+            logger.info(f"\n[Turn {turn_idx}] Sending chat request with {len(messages)} messages\n")
             output = await post(url, payload)
 
-            # Check for abort
-            if output["meta_info"]["finish_reason"]["type"] == "abort":
+            # Extract response from chat completion format
+            if "choices" not in output or len(output["choices"]) == 0:
+                logger.error(f"[Turn {turn_idx}] Invalid response from API: {output}")
                 sample.status = Sample.Status.ABORTED
                 return sample
 
-            cur_response = output["text"]
+            choice = output["choices"][0]
+
+            # Check for abort/stop
+            finish_reason = choice.get("finish_reason", "stop")
+            if finish_reason == "abort":
+                sample.status = Sample.Status.ABORTED
+                return sample
+
+            cur_response = choice["message"]["content"]
+            logger.info(f"\n[Turn {turn_idx}] Model response:\n{cur_response}\n")
+
+            # Add assistant message to conversation
+            messages.append({"role": "assistant", "content": cur_response})
 
             # Tokenize current response
             cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
 
-            # Add to response
+            # Add to response tracking
             response += cur_response
             response_token_ids += cur_response_token_ids
             loss_mask += [1] * len(cur_response_token_ids)  # Train on model outputs
+
+            # Update full text for tracking
+            full_text += cur_response
 
             # Parse bash command from response
             command, done = parse_bash_command(cur_response)
@@ -378,10 +430,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             if command is None:
                 # No valid command, add feedback and continue
                 feedback = "\n[No valid bash command found. Please provide a bash command in ```bash``` blocks or respond with DONE when finished.]\n"
+
+                # Add as user message
+                messages.append({"role": "user", "content": feedback})
+
                 feedback_tokens = state.tokenizer(feedback, add_special_tokens=False)["input_ids"]
                 response += feedback
                 response_token_ids += feedback_tokens
                 loss_mask += [0] * len(feedback_tokens)  # Don't train on feedback
+                full_text += feedback
                 continue
 
             # Execute command in SWE environment (if available)
@@ -402,15 +459,18 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 logger.warning(f"[SWE-agent Exec] Turn {turn_idx}: Using mock execution (env not initialized)")
 
             # Add command output as observation using next_step_template
-            # Format observation using SWE-agent template
+            # Format observation using SWE-agent template and add as user message
             observation = SWE_CONFIGS["next_step_template"].replace("{{observation}}", command_output)
+            messages.append({"role": "user", "content": observation})
+
             obs_tokens = state.tokenizer(observation, add_special_tokens=False)["input_ids"]
             response += observation
             response_token_ids += obs_tokens
             loss_mask += [0] * len(obs_tokens)  # Don't train on observations
+            full_text += observation
 
             # Check if we hit max length
-            if output["meta_info"]["finish_reason"]["type"] == "length":
+            if finish_reason == "length":
                 break
 
         # Get final patch from environment
@@ -444,7 +504,6 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     sample.prompt = prompt_text
 
     # Set status based on finish reason
-    finish_reason = output["meta_info"]["finish_reason"]["type"]
     if finish_reason == "length":
         sample.status = Sample.Status.TRUNCATED
     elif finish_reason == "abort":
