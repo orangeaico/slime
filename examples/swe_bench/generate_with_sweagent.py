@@ -525,6 +525,17 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             agent.traj_path = output_dir / f"{instance_id}.traj"
             logger.debug(f"[Slime-SWE] Trajectory will be saved to: {agent.traj_path}")
 
+            # CRITICAL: Install tools to make commands like str_replace_editor available
+            # This adds tool bin directories to PATH in the container
+            logger.info(f"[Slime-SWE] Installing agent tools (this adds bins to PATH)...")
+            try:
+                agent.tools.install(env)
+                logger.info(f"[Slime-SWE] ✓ Tools installed successfully")
+            except Exception as e:
+                logger.error(f"[Slime-SWE] ✗ Failed to install tools: {e}")
+                logger.exception(e)
+                raise
+
             # Initialize history with system and instance prompts as HistoryItem entries
             agent.history = [
                 {
