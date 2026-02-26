@@ -51,6 +51,11 @@ logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(leve
 logger = get_logger(__name__)
 logger.setLevel(logging.DEBUG)
 
+# Global lock to serialize Docker container startups
+# When multiple generate() calls run concurrently, Docker startups must be serialized
+# to avoid resource contention and runtime startup deadlocks
+_docker_startup_lock = asyncio.Lock()
+
 
 class SlimeLLMModel(AbstractModel):
     """Custom LLM model that uses sglang chat completions API for slime training.
@@ -425,9 +430,12 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         logger.info(f"[Slime-SWE] Creating SWEEnv...")
         env = SWEEnv.from_config(env_config)
 
-        logger.info(f"[Slime-SWE] Starting environment...")
-        await _async_env_start(env)
-        logger.info(f"[Slime-SWE] ✓ Environment ready")
+        # Serialize Docker container startups to prevent concurrent health check deadlocks
+        logger.info(f"[Slime-SWE] Waiting for Docker startup lock...")
+        async with _docker_startup_lock:
+            logger.info(f"[Slime-SWE] Lock acquired, starting environment...")
+            await _async_env_start(env)
+            logger.info(f"[Slime-SWE] ✓ Environment ready, releasing lock")
 
         # 4. Load SWE-agent configuration from YAML
         config_path = Path("/root/swe_livup/config/test_xml_v2.yaml")
