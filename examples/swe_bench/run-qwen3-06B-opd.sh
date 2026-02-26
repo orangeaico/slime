@@ -12,10 +12,9 @@ set -ex
 
 # Start the teacher model server
 TEACHER_IP="127.0.0.1"
-TEACHER_PORT=4500
+TEACHER_PORT=4600
 LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
-## Launch the teacher model server in the background
 # CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server \
 #     --model-path /root/data/hf_models/Qwen3-1.7B \
 #     --host 0.0.0.0 \
@@ -34,8 +33,8 @@ LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 #     sleep 5
 # done
 
-curl http://$TEACHER_IP:$TEACHER_PORT/get_model_info
-echo "Teacher model server is up and running at $TEACHER_IP:$TEACHER_PORT."
+# curl http://$TEACHER_IP:$TEACHER_PORT/get_model_info
+# echo "Teacher model server is up and running at $TEACHER_IP:$TEACHER_PORT."
 # sleep 10
 
 
@@ -43,16 +42,16 @@ export PYTHONBUFFERED=16
 
 # Create SWE-agent required directories
 mkdir -p /home/shared
-mkdir -p /tmp/swe_agent_cache
-mkdir -p /tmp/swe_agent_trajectories
+mkdir -p /root/repo/slime/outputs/swe_agent_cache
+mkdir -p /root/repo/slime/outputs/swe_agent_trajectories
 
 # Fix git safe.directory issue for swe_livup
 git config --global --add safe.directory /root/swe_livup
 
 # Set SWE-agent environment variables
 export SWE_AGENT_CONFIG_ROOT=/root/swe_livup
-export SWE_AGENT_CACHE_ROOT=/tmp/swe_agent_cache
-export SWE_AGENT_TRAJECTORY_DIR=/tmp/swe_agent_trajectories
+export SWE_AGENT_CACHE_ROOT=/root/repo/slime/outputs/swe_agent_cache
+export SWE_AGENT_TRAJECTORY_DIR=/root/repo/slime/outputs/swe_agent_trajectories
 
 NVLINK_COUNT=$(nvidia-smi topo -m 2>/dev/null | grep -o 'NV[0-9][0-9]*' | wc -l)
 if [ "$NVLINK_COUNT" -gt 0 ]; then
@@ -78,8 +77,8 @@ CKPT_ARGS=(
 )
 
 CUSTOM_ARGS=(
-   # Multi-turn generate function with SWE-agent
-   --custom-generate-function-path examples.swe_bench.generate.generate
+   # Multi-turn generate function using proper SWE-agent DefaultAgent integration
+   --custom-generate-function-path examples.swe_bench.generate_with_sweagent.generate
 
    # Reward functions for pure distillation
    --custom-rm-path examples.swe_bench.reward.reward_func
@@ -90,17 +89,17 @@ CUSTOM_ARGS=(
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data examples/swe_bench/data/train_with_images.jsonl
+   --prompt-data examples/swe_bench/data/train.jsonl
    --input-key prompt
    # Don't apply chat template - we handle it in generate.py
    --rollout-shuffle
    --num-rollout 50
    --rollout-batch-size 1  # REDUCED: 2->1 to avoid simultaneous Docker startups
-   --n-samples-per-prompt 1  # REDUCED: 2->1 to avoid resource contention
+   --n-samples-per-prompt 2  # REDUCED: 2->1 to avoid resource contention
    --rollout-max-response-len 4096  # Long context for multi-turn
    --rollout-temperature 0.8
 
-   --global-batch-size 1
+   --global-batch-size 2
    --balance-data
 )
 
@@ -181,7 +180,7 @@ MISC_ARGS=(
 
 DEBUG_ARGS=(
    # Save rollout trajectories for debugging and analysis
-   --save-debug-rollout-data /tmp/swe_agent_trajectories/rollout_{rollout_id}.pt
+   --save-debug-rollout-data /root/repo/slime/outputs/swe_agent_trajectories/rollout_{rollout_id}.pt
 )
 
 
@@ -198,8 +197,8 @@ ray job submit --address="http://127.0.0.1:8265" \
         "PYTHONPATH": "/root/Megatron-LM/:/root/swe_livup",
         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
         "SWE_AGENT_CONFIG_ROOT": "/root/swe_livup",
-        "SWE_AGENT_CACHE_ROOT": "/tmp/swe_agent_cache",
-        "SWE_AGENT_TRAJECTORY_DIR": "/tmp/swe_agent_trajectories"
+        "SWE_AGENT_CACHE_ROOT": "/root/repo/slime/outputs/swe_agent_cache",
+        "SWE_AGENT_TRAJECTORY_DIR": "/root/repo/slime/outputs/swe_agent_trajectories"
      }
    }' \
    -- python3 train.py \

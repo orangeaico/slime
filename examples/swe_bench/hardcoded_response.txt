@@ -1,0 +1,5 @@
+Let me explore the repository structure first.
+
+<function=bash>
+<parameter=command>ls -la /testbed</parameter>
+</function>

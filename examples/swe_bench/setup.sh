@@ -1,3 +1,3 @@
-pip install swe-rex ghapi
+pip install swe-rex ghapi simple-parsing tenacity unidiff litellm
 
 apt-get update && apt-get install -y docker.io docker-buildx
