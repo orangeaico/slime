@@ -44,12 +44,12 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
-# Enable debug logging for swe-agent
+# Enable logging for swe-agent
 import logging
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
 logger = get_logger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 # Global lock to serialize Docker container startups
 # When multiple generate() calls run concurrently, Docker startups must be serialized
@@ -750,17 +750,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             dump_dir = Path("/root/repo/slime/outputs/swe_agent_samples")
             dump_dir.mkdir(parents=True, exist_ok=True)
 
-            # Create filename from instance_id and timestamp
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # Create filename from instance_id only
             instance_id = sample.metadata.get("instance_id", "unknown")
             safe_instance_id = instance_id.replace("/", "_").replace(":", "_")
-            dump_file = dump_dir / f"{safe_instance_id}_{timestamp}.json"
+            dump_file = dump_dir / f"{safe_instance_id}.json"
 
             # Prepare sample data for JSON serialization
             sample_data = {
                 "metadata": {
                     "instance_id": instance_id,
-                    "timestamp": timestamp,
                     "status": str(sample.status),
                     "turn_count": turn_count,
                     "repo": sample.metadata.get("repo", ""),
