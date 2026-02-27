@@ -390,8 +390,10 @@ async def generate_rollout_async(
 
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
+                # Safely format reward for logging (avoid huge dicts with teacher logprobs)
+                reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"<dict with {len(sample.reward)} keys>"
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
                 )
                 do_print = False
 
@@ -411,8 +413,10 @@ async def generate_rollout_async(
 
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
+    # Safely format reward for logging (avoid huge dicts with teacher logprobs)
+    reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"<dict with {len(sample.reward)} keys>"
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
     )
 
     # there are still some unfinished requests, abort them
@@ -531,10 +535,12 @@ async def eval_rollout_single_dataset(
     for coro in asyncio.as_completed(tasks):
         sample = await coro
         if do_print:
+            # Safely format reward for logging (avoid huge dicts with teacher logprobs)
+            reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"<dict with {len(sample.reward)} keys>"
             logger.info(
                 "eval_rollout_single_dataset example data: "
                 f"{[str(sample.prompt) + sample.response]} "
-                f"reward={sample.reward}"
+                f"reward={reward_summary}"
             )
             do_print = False
         if isinstance(sample, list):

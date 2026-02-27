@@ -45,7 +45,11 @@ async def reward_func(args, sample, **kwargs):
     async with aiohttp.ClientSession(**session_kwargs) as session:
         async with session.post(args.rm_url, json=payload) as resp:
             resp.raise_for_status()
-            return await resp.json()
+            result = await resp.json()
+            # Add scalar reward field for metrics computation
+            # For pure OPD, task reward is always 0.0
+            result["reward"] = 0.0
+            return result
 
 
 def post_process_rewards(args, samples: list[Sample], **kwargs):
@@ -66,7 +70,8 @@ def post_process_rewards(args, samples: list[Sample], **kwargs):
     Returns:
         tuple: (rewards, rewards) - both are lists of 0.0 for pure distillation
     """
-    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    # Access sample.reward directly to get the full dict (not the scalar from get_reward_value)
+    raw_rewards = [sample.reward for sample in samples]
     response_lengths = [sample.response_length for sample in samples]
 
     # Extract teacher log-probs from the sglang response

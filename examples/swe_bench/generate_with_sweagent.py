@@ -609,7 +609,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # This is the key: swe-agent expects to run in a sync context, so we give it one
         logger.info(f"[Slime-SWE] Running agent loop in background thread (swe-agent needs sync context)")
 
-        max_turns = agent_config_dict.get("max_turns", 3)
+        max_turns = agent_config_dict.get("max_turns", 5)
         logger.info(f"[Slime-SWE] Configuration: max_turns={max_turns}, temperature={sampling_params.get('temperature', 0.7) if isinstance(sampling_params, dict) else 0.7}")
 
         import concurrent.futures
@@ -629,59 +629,73 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         logger.info(f"[Slime-SWE] Trajectory: {len(trajectory)} steps")
         logger.info(f"[Slime-SWE] History: {len(history)} messages")
         logger.debug(f"[Slime-SWE] Info keys: {list(info.keys())}")
+        logger.debug(f"[Slime-SWE] Traj data keys: {list(traj_data.keys())}")
 
         # 11. Convert trajectory to Sample format for slime training
         logger.info(f"[Slime-SWE] Converting trajectory to training sample...")
 
-        # Build full conversation text from history
-        # We need to reconstruct the tokenized conversation with proper loss masking
-        full_text = ""
+        # Use history from traj_data - it already contains the full conversation
+        # with proper role/content formatting
+        conversation_list = list(history)  # Make a copy
+
+        # Ensure we only include messages up to the last assistant message
+        # Find the last assistant message
+        last_assistant_idx = -1
+        for i in range(len(conversation_list) - 1, -1, -1):
+            if conversation_list[i].get("role") == "assistant":
+                last_assistant_idx = i
+                break
+
+        # Truncate to last assistant message
+        if last_assistant_idx >= 0:
+            conversation_list = conversation_list[:last_assistant_idx + 1]
+            logger.info(f"[Slime-SWE] Truncated conversation to {len(conversation_list)} messages (up to last assistant)")
+        else:
+            logger.warning(f"[Slime-SWE] No assistant messages found in history!")
+
+        # Tokenize using the same approach as SFT dataset (_process_example function)
+        # This ensures proper formatting with chat template tags (im_start, im_end, etc.)
         full_tokens = []
-        loss_mask = []
+        full_loss_mask = []  # Covers entire sequence (for SFT format)
 
-        # Build initial messages (already created during agent setup)
-        initial_messages = setup_messages
+        logger.debug(f"[Slime-SWE] Tokenizing conversation message-by-message...")
+        for i, msg in enumerate(conversation_list):
+            # Use apply_chat_template for each message to get proper formatting
+            seg_ids = state.tokenizer.apply_chat_template(
+                [msg], tokenize=True, add_generation_prompt=False
+            )
+            full_tokens.extend(seg_ids)
 
-        logger.debug(f"[Slime-SWE] Tokenizing initial prompt with {len(initial_messages)} messages...")
-        # Tokenize initial prompt
-        prompt_text = state.tokenizer.apply_chat_template(
-            initial_messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False
-        )
-        prompt_tokens = state.tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
+            # Track which tokens are trainable (assistant) vs masked (user/system)
+            if msg["role"] == "assistant":
+                full_loss_mask.extend([1] * len(seg_ids))
+                logger.debug(f"[Slime-SWE] Message {i+1} ({msg['role']}): {len(seg_ids)} tokens (trainable)")
+            else:
+                full_loss_mask.extend([0] * len(seg_ids))
+                logger.debug(f"[Slime-SWE] Message {i+1} ({msg['role']}): {len(seg_ids)} tokens (masked)")
 
-        full_text = prompt_text
-        full_tokens = prompt_tokens
-        loss_mask = [0] * len(prompt_tokens)  # Don't train on prompt
+        # Reconstruct full text for debugging/inspection
+        full_text = state.tokenizer.decode(full_tokens, skip_special_tokens=False)
 
-        logger.debug(f"[Slime-SWE] Prompt: {len(prompt_tokens)} tokens")
+        # Calculate prompt tokens (everything before first assistant response)
+        prompt_tokens = []
+        for i, msg in enumerate(conversation_list):
+            if msg["role"] == "assistant":
+                break
+            seg_ids = state.tokenizer.apply_chat_template(
+                [msg], tokenize=True, add_generation_prompt=False
+            )
+            prompt_tokens.extend(seg_ids)
 
-        # Add each step's response and observation
-        logger.debug(f"[Slime-SWE] Processing {len(trajectory)} trajectory steps...")
-        for i, step in enumerate(trajectory):
-            # Model response (train on this)
-            response = step.get("response", "")
-            if response:
-                response_tokens = state.tokenizer(response, add_special_tokens=False)["input_ids"]
-                full_text += response
-                full_tokens += response_tokens
-                loss_mask += [1] * len(response_tokens)
-                logger.debug(f"[Slime-SWE] Step {i+1}: Added response ({len(response_tokens)} tokens, trainable)")
+        # Extract response-only loss mask (framework expects loss_mask to cover only response tokens)
+        # This is different from SFT dataset format which covers the entire sequence
+        response_start_idx = len(prompt_tokens)
+        loss_mask = full_loss_mask[response_start_idx:]  # Only response tokens
 
-            # Observation (don't train on this)
-            observation = step.get("observation", "")
-            if observation:
-                # Format observation using next_step_template
-                next_step_template = agent_config.templates.next_step_template
-                formatted_obs = next_step_template.replace("{{observation}}", observation)
-
-                obs_tokens = state.tokenizer(formatted_obs, add_special_tokens=False)["input_ids"]
-                full_text += formatted_obs
-                full_tokens += obs_tokens
-                loss_mask += [0] * len(obs_tokens)
-                logger.debug(f"[Slime-SWE] Step {i+1}: Added observation ({len(obs_tokens)} tokens, masked)")
+        logger.debug(f"[Slime-SWE] Total tokens: {len(full_tokens)}")
+        logger.debug(f"[Slime-SWE] Prompt tokens: {len(prompt_tokens)}")
+        logger.debug(f"[Slime-SWE] Response tokens: {len(full_tokens) - len(prompt_tokens)}")
+        logger.debug(f"[Slime-SWE] Loss mask length (response only): {len(loss_mask)}")
 
         # 12. Extract final patch
         logger.info(f"[Slime-SWE] Extracting final git diff patch...")
@@ -695,9 +709,17 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         # 13. Store in sample
         logger.info(f"[Slime-SWE] Preparing final sample...")
+
+        # Decode prompt text from prompt tokens
+        prompt_text = state.tokenizer.decode(prompt_tokens, skip_special_tokens=False)
+
+        # Decode response text (everything after prompt)
+        response_tokens = full_tokens[len(prompt_tokens):]
+        response_text = state.tokenizer.decode(response_tokens, skip_special_tokens=False)
+
         sample.tokens = full_tokens
-        sample.response_length = len(full_tokens) - len(prompt_tokens)
-        sample.response = full_text[len(prompt_text):]
+        sample.response_length = len(response_tokens)
+        sample.response = response_text
         sample.loss_mask = loss_mask
         sample.prompt = prompt_text
         sample.status = Sample.Status.COMPLETED
@@ -718,6 +740,100 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         logger.info(f"[Slime-SWE]   - Trainable tokens: {trainable_tokens}")
         logger.info(f"[Slime-SWE]   - Masked tokens: {masked_tokens}")
         logger.info(f"[Slime-SWE]   - Turns completed: {turn_count}")
+
+        # 14. Dump sample to outputs directory for inspection
+        try:
+            import json
+            from datetime import datetime
+
+            # Create sample dump directory
+            dump_dir = Path("/root/repo/slime/outputs/swe_agent_samples")
+            dump_dir.mkdir(parents=True, exist_ok=True)
+
+            # Create filename from instance_id and timestamp
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            instance_id = sample.metadata.get("instance_id", "unknown")
+            safe_instance_id = instance_id.replace("/", "_").replace(":", "_")
+            dump_file = dump_dir / f"{safe_instance_id}_{timestamp}.json"
+
+            # Prepare sample data for JSON serialization
+            sample_data = {
+                "metadata": {
+                    "instance_id": instance_id,
+                    "timestamp": timestamp,
+                    "status": str(sample.status),
+                    "turn_count": turn_count,
+                    "repo": sample.metadata.get("repo", ""),
+                    "base_commit": sample.metadata.get("base_commit", ""),
+                    "problem_statement": sample.metadata.get("problem_statement", ""),
+                    "patch": sample.metadata.get("patch", ""),
+                    "test_patch": sample.metadata.get("test_patch", ""),
+                    "hints_text": sample.metadata.get("hints_text", ""),
+                },
+                "tokenization": {
+                    "total_tokens": len(sample.tokens),
+                    "prompt_tokens": len(prompt_tokens),
+                    "response_tokens": sample.response_length,
+                    "trainable_tokens": trainable_tokens,
+                    "masked_tokens": masked_tokens,
+                },
+                "conversation_list": conversation_list,  # Full conversation in SFT format (truncated to last assistant)
+                "full_history": history,  # Complete history from SWE-agent (before truncation)
+                "formatted_conversation": "\n\n".join([
+                    f"[{msg['role'].upper()}]\n{msg['content'][:500]}{'...' if len(msg['content']) > 500 else ''}"
+                    for msg in conversation_list
+                ]),  # Human-readable conversation
+                "response": {
+                    "text": sample.response,
+                    "tokens_count": sample.response_length,
+                },
+                "trajectory": {
+                    "steps": [
+                        {
+                            "step_num": i + 1,
+                            "action": step.get("action", ""),
+                            "response": step.get("response", ""),
+                            "observation": step.get("observation", ""),
+                            "response_length": len(step.get("response", "")),
+                            "observation_length": len(step.get("observation", "")),
+                        }
+                        for i, step in enumerate(trajectory)
+                    ],
+                    "total_steps": len(trajectory),
+                },
+                "loss_mask": {
+                    "response_only": {
+                        "length": len(loss_mask),
+                        "trainable_positions": sum(loss_mask),
+                        "masked_positions": len(loss_mask) - sum(loss_mask),
+                        "mask_preview": loss_mask[:100] if len(loss_mask) > 100 else loss_mask,
+                    },
+                    "full_sequence": {
+                        "length": len(full_loss_mask),
+                        "trainable_positions": sum(full_loss_mask),
+                        "masked_positions": len(full_loss_mask) - sum(full_loss_mask),
+                        "mask_preview": full_loss_mask[:100] if len(full_loss_mask) > 100 else full_loss_mask,
+                    },
+                    "note": "response_only is what's used for training (framework expects this), full_sequence is for SFT format reference"
+                },
+                "full_text_preview": {
+                    "full_text": full_text,                    
+                    "total_length": len(full_text),
+                },
+                "agent_info": {
+                    "exit_status": info.get("exit_status", ""),
+                    "model_stats": info.get("model_stats", {}),
+                }
+            }
+
+            # Write to file with pretty formatting
+            with open(dump_file, 'w') as f:
+                json.dump(sample_data, f, indent=2, ensure_ascii=False)
+
+            logger.info(f"[Slime-SWE] ✓ Sample dumped to {dump_file}")
+
+        except Exception as e:
+            logger.error(f"[Slime-SWE] ✗ Failed to dump sample: {e}")
 
         return sample
 
