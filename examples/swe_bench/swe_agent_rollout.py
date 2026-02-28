@@ -29,6 +29,7 @@ from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)  # Keep our own script logs at DEBUG level
 
 
 async def generate_rollout_swe_agent(

@@ -177,18 +177,33 @@ async def _post(client, url, payload, max_retries=60, headers=None):
         except Exception as e:
             retry_count += 1
 
+            # Handle closed connection errors more gracefully - they're expected with connection pooling
+            is_connection_error = isinstance(e, (RuntimeError, httpx.RemoteProtocolError)) or \
+                                  "TCPTransport closed" in str(e) or \
+                                  "RemoteProtocolError" in str(e)
+
             if isinstance(e, httpx.HTTPStatusError):
                 response_text = e.response.text
             else:
                 response_text = None
 
-            logger.info(
-                f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
-            )
+            # Only log connection errors at debug level (they're common and handled by retry)
+            if is_connection_error and retry_count < 3:
+                logger.debug(
+                    f"Connection error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url})"
+                )
+            else:
+                logger.info(
+                    f"Error: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url}, response={response_text})"
+                )
+
             if retry_count >= max_retries:
                 logger.info(f"Max retries ({max_retries}) reached, failing... (url={url})")
                 raise e
-            await asyncio.sleep(1)
+
+            # For connection errors, retry immediately; for others, wait 1 second
+            if not is_connection_error:
+                await asyncio.sleep(1)
             continue
         finally:
             if response is not None:
@@ -288,9 +303,41 @@ async def post(url, payload, max_retries=60, headers=None):
     return await _post(_http_client, url, payload, max_retries, headers=headers)
 
 
-async def get(url):
-    response = await _http_client.get(url)
-    response.raise_for_status()
-    content = await response.aread()
-    output = json.loads(content)
-    return output
+async def get(url, max_retries=60):
+    retry_count = 0
+    while retry_count < max_retries:
+        response = None
+        try:
+            response = await _http_client.get(url)
+            response.raise_for_status()
+            content = await response.aread()
+            output = json.loads(content)
+            return output
+        except Exception as e:
+            retry_count += 1
+
+            # Handle closed connection errors more gracefully - they're expected with connection pooling
+            is_connection_error = isinstance(e, (RuntimeError, httpx.RemoteProtocolError)) or \
+                                  "TCPTransport closed" in str(e) or \
+                                  "RemoteProtocolError" in str(e)
+
+            # Only log connection errors at debug level (they're common and handled by retry)
+            if is_connection_error and retry_count < 3:
+                logger.debug(
+                    f"Connection error on GET: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url})"
+                )
+            else:
+                logger.info(
+                    f"Error on GET: {e}, retrying... (attempt {retry_count}/{max_retries}, url={url})"
+                )
+
+            if retry_count >= max_retries:
+                logger.info(f"Max retries ({max_retries}) reached on GET, failing... (url={url})")
+                raise e
+
+            # For connection errors, retry immediately; for others, wait 1 second
+            if not is_connection_error:
+                await asyncio.sleep(1)
+        finally:
+            if response is not None:
+                await response.aclose()

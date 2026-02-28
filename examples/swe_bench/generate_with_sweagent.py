@@ -44,6 +44,13 @@ from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
 
+
+class AbortedException(Exception):
+    """Exception raised when LLM request is aborted by the server."""
+
+    pass
+
+
 # Enable logging for swe-agent
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -96,9 +103,17 @@ class SlimeLLMModel(AbstractModel):
         """
         # HARDCODED RESPONSE FOR DEBUGGING
         # Check if hardcoded response file exists
-        hardcoded_response_path = Path("/root/repo/slime/examples/swe_bench/hardcoded_response.txt")
+        hardcoded_response_path = Path("/root/repo/slime/examples/swe_bench/hardcoded_response_none.txt")
         if hardcoded_response_path.exists():
             self.logger.info(f"[SlimeLLM] Using hardcoded response from {hardcoded_response_path}")
+
+            # Check for abort before returning hardcoded response
+            from slime.rollout.sglang_rollout import GenerateState
+            state = GenerateState(self.args)
+            if state.aborted:
+                self.logger.info(f"[SlimeLLM] ⚠ Request aborted, raising AbortedException")
+                raise AbortedException("LLM request aborted by server")
+
             with open(hardcoded_response_path, 'r') as f:
                 hardcoded_message = f.read().strip()
 
@@ -172,6 +187,13 @@ class SlimeLLMModel(AbstractModel):
         self.logger.debug(f"[SlimeLLM] ✓ Received response: {len(message_content)} chars")
         self.logger.debug(f"[SlimeLLM] Response preview: {message_content[:300]}...")
 
+        # Check for abort (following the pattern from examples/search-r1/generate_with_search.py)
+        if "meta_info" in response and "finish_reason" in response["meta_info"]:
+            finish_type = response["meta_info"]["finish_reason"].get("type")
+            if finish_type == "abort":
+                self.logger.info(f"[SlimeLLM] ⚠ Request was aborted by server")
+                raise AbortedException("LLM request aborted by server")
+
         # Build output dict
         output_dict = {"message": message_content}
 
@@ -244,20 +266,34 @@ class SlimeLLMModel(AbstractModel):
         return messages
 
 
-async def _async_env_start(env: SWEEnv):
+async def _async_env_start(env: SWEEnv, state: GenerateState = None):
     """Start SWEEnv in async context.
 
     This replicates env.start() but uses await instead of asyncio.run()
     to work within an async event loop.
+
+    Args:
+        env: SWEEnv instance
+        state: GenerateState for abort checking (optional)
     """
+    # Check for abort before starting deployment (slowest operation)
+    if state and state.aborted:
+        logger.info(f"[SWE-agent Init] ⚠ Abort detected, skipping deployment start")
+        raise AbortedException("Aborted during Docker setup")
+
     # Step 1: Start deployment (boot Docker container)
     logger.info(f"[SWE-agent Init] Starting deployment...")
     env._chook.on_start_deployment()
     await env.deployment.start()
     logger.info(f"[SWE-agent Init] ✓ Deployment started")
 
+    # Check for abort after deployment starts
+    if state and state.aborted:
+        logger.info(f"[SWE-agent Init] ⚠ Abort detected after deployment, skipping remaining setup")
+        raise AbortedException("Aborted during Docker setup")
+
     # Step 2: Create bash session
-    logger.info(f"[SWE-agent Init] Creating bash session...")
+    logger.debug(f"[SWE-agent Init] Creating bash session...")
     await env.deployment.runtime.create_session(
         CreateBashSessionRequest(startup_source=["/root/.bashrc"], startup_timeout=10)
     )
@@ -275,19 +311,24 @@ async def _async_env_start(env: SWEEnv):
     logger.info(f"[SWE-agent Init] ✓ Environment variables set")
 
     # Step 4: cd to root
-    logger.info(f"[SWE-agent Init] Changing to root directory...")
+    logger.debug(f"[SWE-agent Init] Changing to root directory...")
     await _async_communicate(env, "cd /", check="raise")
 
     # Step 5: Handle repository setup
     if env.repo is not None:
         if isinstance(env.repo, PreExistingRepoConfig):
-            logger.info(f"[SWE-agent Init] Repository '{env.repo.repo_name}' already exists in container")
+            logger.debug(f"[SWE-agent Init] Repository '{env.repo.repo_name}' already exists in container")
         elif isinstance(env.repo, GithubRepoConfig):
             logger.info(f"[SWE-agent Init] Checking if repo {env.repo.repo_name} exists...")
             folders_output = await _async_communicate(env, "ls", check="raise")
             folders = folders_output.split("\n")
 
             if env.repo.repo_name not in folders:
+                # Check for abort before expensive git clone
+                if state and state.aborted:
+                    logger.info(f"[SWE-agent Init] ⚠ Abort detected before git clone, skipping")
+                    raise AbortedException("Aborted during Docker setup")
+
                 logger.info(f"[SWE-agent Init] Cloning repository {env.repo.repo_name}...")
                 env._chook.on_copy_repo_started(repo=env.repo)
 
@@ -304,7 +345,7 @@ async def _async_env_start(env: SWEEnv):
                 logger.info(f"[SWE-agent Init] ✓ Repository cloned")
 
         # Step 6: Reset repository to clean state
-        logger.info(f"[SWE-agent Init] Resetting repository to clean state...")
+        logger.debug(f"[SWE-agent Init] Resetting repository to clean state...")
         startup_commands = [
             f"cd /{env.repo.repo_name}",
             "export ROOT=$(pwd -P)",
@@ -319,7 +360,7 @@ async def _async_env_start(env: SWEEnv):
         logger.info(f"[SWE-agent Init] ✓ Repository reset complete")
 
     # Step 7: Run post-startup commands
-    logger.info(f"[SWE-agent Init] Running {len(env._post_startup_commands)} post-startup commands...")
+    logger.debug(f"[SWE-agent Init] Running {len(env._post_startup_commands)} post-startup commands...")
     for command in env._post_startup_commands:
         await _async_communicate(env, command, check="raise", timeout=env.post_startup_command_timeout)
 
@@ -373,14 +414,20 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     problem_statement = sample.prompt
 
     logger.info(f"[Slime-SWE] Starting instance: {instance_id}")
-    logger.info(f"[Slime-SWE] Repository: {repo_name}")
-    logger.info(f"[Slime-SWE] Base commit: {base_commit}")
+    # logger.info(f"[Slime-SWE] Repository: {repo_name}")
+    # logger.info(f"[Slime-SWE] Base commit: {base_commit}")
 
     # Initialize SWE environment
     env = None
     agent = None
 
     try:
+        # Check for abort before starting expensive Docker setup
+        if state.aborted:
+            logger.info(f"[Slime-SWE] ⚠ Abort detected before Docker setup, skipping instance")
+            sample.status = Sample.Status.ABORTED
+            return sample
+
         # 1. Create repo config
         if image_name and image_name.startswith("swebench/"):
             # Pre-built SWE-bench images have the repo at /testbed
@@ -427,14 +474,26 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         )
 
         # 3. Create SWEEnv
-        logger.info(f"[Slime-SWE] Creating SWEEnv...")
+        logger.debug(f"[Slime-SWE] Creating SWEEnv...")
         env = SWEEnv.from_config(env_config)
+
+        # Check for abort before expensive Docker startup
+        if state.aborted:
+            logger.info(f"[Slime-SWE] ⚠ Abort detected before Docker startup, skipping")
+            sample.status = Sample.Status.ABORTED
+            return sample
 
         # Serialize Docker container startups to prevent concurrent health check deadlocks
         logger.info(f"[Slime-SWE] Waiting for Docker startup lock...")
         async with _docker_startup_lock:
+            # Check abort again after acquiring lock (might have been aborted while waiting)
+            if state.aborted:
+                logger.info(f"[Slime-SWE] ⚠ Abort detected after acquiring lock, skipping startup")
+                sample.status = Sample.Status.ABORTED
+                return sample
+
             logger.info(f"[Slime-SWE] Lock acquired, starting environment...")
-            await _async_env_start(env)
+            await _async_env_start(env, state)  # Pass state for abort checking
             logger.info(f"[Slime-SWE] ✓ Environment ready, releasing lock")
 
         # 4. Load SWE-agent configuration from YAML
@@ -455,16 +514,17 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # Create DefaultAgentConfig from YAML
         agent_config = DefaultAgentConfig(**agent_config_dict)
 
-        logger.info(f"[Slime-SWE] Loaded agent config from YAML")
+        logger.debug(f"[Slime-SWE] Loaded agent config from YAML")
 
         # 5. Create custom model instance
         # We need to manually create the model since we're using a custom class
         model = SlimeLLMModel(config=agent_config.model, tools=agent_config.tools)
+        model.args = args  # Store args for abort checking
         model.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/chat/completions"
         model.sglang_model_name = "/root/data/hf_models/Qwen3-1.7B"
         model.tokenizer = state.tokenizer
 
-        logger.info(f"[Slime-SWE] Created SlimeLLMModel")
+        logger.debug(f"[Slime-SWE] Created SlimeLLMModel")
 
         # 6. Create agent manually (bypass from_config to use our custom model)
         from sweagent.tools.tools import ToolHandler
@@ -495,7 +555,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         instance_prompt = instance_template.replace("{{working_dir}}", working_dir)
         instance_prompt = instance_prompt.replace("{{problem_statement}}", problem_statement)
 
-        logger.info(f"[Slime-SWE] Built system and instance prompts")
+        logger.debug(f"[Slime-SWE] Built system and instance prompts")
 
         # 8. Manual agent initialization (avoid asyncio.run() conflict)
         problem_stmt = TextProblemStatement(
@@ -506,7 +566,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         output_dir = Path("/root/repo/slime/outputs/swe_agent_trajectories") / instance_id
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"[Slime-SWE] Setting up agent for background thread execution...")
+        logger.debug(f"[Slime-SWE] Setting up agent for background thread execution...")
 
         # Build initial messages for later use in tokenization
         setup_messages = [
@@ -535,7 +595,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
             # CRITICAL: Install tools to make commands like str_replace_editor available
             # This adds tool bin directories to PATH in the container
-            logger.info(f"[Slime-SWE] Installing agent tools (this adds bins to PATH)...")
+            logger.debug(f"[Slime-SWE] Installing agent tools (this adds bins to PATH)...")
             try:
                 agent.tools.install(env)
                 logger.info(f"[Slime-SWE] ✓ Tools installed successfully")
@@ -567,6 +627,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
             # Run agent loop
             turn_count = 0
+            aborted = False
 
             while turn_count < max_turns:
                 try:
@@ -579,7 +640,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     logger.info(f"[Slime-SWE] Turn {turn_count + 1}: Action: {step_output.action[:200] if step_output.action else 'None'}...")
                     logger.info(f"[Slime-SWE] Turn {turn_count + 1}: Observation: {len(step_output.observation)} chars")
                     logger.debug(f"[Slime-SWE] Turn {turn_count + 1}: Done flag: {step_output.done}")
-                    logger.debug(f"[Slime-SWE] Turn {turn_count + 1}: Observation preview: {step_output.observation[:500]}...")
+                    # logger.debug(f"[Slime-SWE] Turn {turn_count + 1}: Observation preview: {step_output.observation[:500]}...")
 
                     turn_count += 1
 
@@ -587,6 +648,12 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     if step_output.done:
                         logger.info(f"[Slime-SWE] ✓ Agent signaled completion at turn {turn_count}")
                         break
+
+                except AbortedException as e:
+                    # LLM request was aborted by server (time-bounded rollout)
+                    logger.info(f"[Slime-SWE] ⚠ Agent loop aborted at turn {turn_count + 1}: {e}")
+                    aborted = True
+                    break
 
                 except Exception as e:
                     logger.error(f"[Slime-SWE] ✗ Error in turn {turn_count + 1}: {type(e).__name__}: {e}")
@@ -603,11 +670,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 logger.exception(e)
                 # Continue anyway - we can still extract trajectory data later
 
-            return turn_count
+            return turn_count, aborted
 
         # 8. Run agent loop in a separate thread to avoid event loop conflicts
         # This is the key: swe-agent expects to run in a sync context, so we give it one
-        logger.info(f"[Slime-SWE] Running agent loop in background thread (swe-agent needs sync context)")
+        logger.debug(f"[Slime-SWE] Running agent loop in background thread (swe-agent needs sync context)")
 
         max_turns = agent_config_dict.get("max_turns", 5)
         logger.info(f"[Slime-SWE] Configuration: max_turns={max_turns}, temperature={sampling_params.get('temperature', 0.7) if isinstance(sampling_params, dict) else 0.7}")
@@ -615,9 +682,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(run_agent_loop_sync, system_prompt, instance_prompt, max_turns)
-            turn_count = future.result()  # Wait for completion
+            turn_count, aborted = future.result()  # Wait for completion
 
-        logger.info(f"[Slime-SWE] ✓ Agent loop completed in background thread ({turn_count} turns)")
+        logger.info(f"[Slime-SWE] ✓ Agent loop completed in background thread ({turn_count} turns, aborted={aborted})")
+
+        # Check if agent loop was aborted (following pattern from examples/search-r1/generate_with_search.py)
+        if aborted:
+            logger.info(f"[Slime-SWE] ⚠ Agent loop was aborted, marking sample as ABORTED")
+            sample.status = Sample.Status.ABORTED
+            return sample
 
         # 10. Extract trajectory data
         logger.info(f"[Slime-SWE] Extracting trajectory data...")
@@ -692,10 +765,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response_start_idx = len(prompt_tokens)
         loss_mask = full_loss_mask[response_start_idx:]  # Only response tokens
 
-        logger.debug(f"[Slime-SWE] Total tokens: {len(full_tokens)}")
-        logger.debug(f"[Slime-SWE] Prompt tokens: {len(prompt_tokens)}")
-        logger.debug(f"[Slime-SWE] Response tokens: {len(full_tokens) - len(prompt_tokens)}")
-        logger.debug(f"[Slime-SWE] Loss mask length (response only): {len(loss_mask)}")
+        logger.info(f"[Slime-SWE] Total tokens: {len(full_tokens)}, Prompt tokens: {len(prompt_tokens)}, Response tokens: {len(full_tokens) - len(prompt_tokens)}, Loss mask length (response only): {len(loss_mask)}")
 
         # 12. Extract final patch
         logger.info(f"[Slime-SWE] Extracting final git diff patch...")
@@ -734,12 +804,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         masked_tokens = len(loss_mask) - trainable_tokens
 
         logger.info(f"[Slime-SWE] ✓ Sample prepared successfully:")
-        logger.info(f"[Slime-SWE]   - Total tokens: {len(sample.tokens)}")
-        logger.info(f"[Slime-SWE]   - Prompt tokens: {len(prompt_tokens)} (masked)")
-        logger.info(f"[Slime-SWE]   - Response tokens: {sample.response_length}")
-        logger.info(f"[Slime-SWE]   - Trainable tokens: {trainable_tokens}")
-        logger.info(f"[Slime-SWE]   - Masked tokens: {masked_tokens}")
-        logger.info(f"[Slime-SWE]   - Turns completed: {turn_count}")
+        logger.info(f"[Slime-SWE]   - Total tokens: {len(sample.tokens)}, Prompt tokens: {len(prompt_tokens)}, Response tokens: {sample.response_length}, Loss mask length (response only): {len(loss_mask)}, Trainable tokens: {trainable_tokens}, Masked tokens: {masked_tokens}, Turns: {turn_count}")
 
         # 14. Dump sample to outputs directory for inspection
         try:
@@ -833,6 +898,12 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         except Exception as e:
             logger.error(f"[Slime-SWE] ✗ Failed to dump sample: {e}")
 
+        return sample
+
+    except AbortedException as e:
+        # Abort during Docker setup is expected behavior (time-bounded rollout)
+        logger.info(f"[Slime-SWE] ⚠ Aborted during setup: {e}")
+        sample.status = Sample.Status.ABORTED
         return sample
 
     except Exception as e:

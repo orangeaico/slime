@@ -311,15 +311,20 @@ async def abort(args: Namespace, rollout_id: int) -> list[list[Sample]]:
     assert not state.aborted
     state.aborted = True
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
+    # Try to send abort requests to sglang engines, but continue even if this fails
+    # The important part is that state.aborted = True (above), which will stop new requests
+    try:
+        if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
+            urls = response["urls"]
+        else:
+            response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
+            urls = [worker["url"] for worker in response["workers"]]
 
-    logger.info(f"Abort request for {urls}")
-    await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
+        logger.info(f"Abort request for {urls}")
+        await asyncio.gather(*[post(f"{url}/abort_request", {"abort_all": True}) for url in urls])
+    except Exception as e:
+        logger.warning(f"Failed to send abort requests to sglang engines: {e}. Continuing anyway (state.aborted is set).")
 
     # make sure all the pending tasks are finished
     count = 0
@@ -391,9 +396,9 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 # Safely format reward for logging (avoid huge dicts with teacher logprobs)
-                reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"<dict with {len(sample.reward)} keys>"
+                reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"Reward value: {sample.reward['reward']}, prompt_tokens: {sample.reward['meta_info']['prompt_tokens']}, completion_tokens: {sample.reward['meta_info']['completion_tokens']}, Input Token Logprobs: {sample.reward['meta_info']['input_token_logprobs'][:10]}, Output Token Logprobs: {sample.reward['meta_info']['output_token_logprobs'][:10]} "
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
+                    f"First rollout sample: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
                 )
                 do_print = False
 
@@ -414,9 +419,9 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     # Safely format reward for logging (avoid huge dicts with teacher logprobs)
-    reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"<dict with {len(sample.reward)} keys>"
+    reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"Reward value: {sample.reward['reward']}, prompt_tokens: {sample.reward['meta_info']['prompt_tokens']}, completion_tokens: {sample.reward['meta_info']['completion_tokens']}, Input Token Logprobs: {sample.reward['meta_info']['input_token_logprobs'][:10]}, Output Token Logprobs: {sample.reward['meta_info']['output_token_logprobs'][:10]} "
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
+        f"Finish rollout: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
     )
 
     # there are still some unfinished requests, abort them
@@ -536,7 +541,7 @@ async def eval_rollout_single_dataset(
         sample = await coro
         if do_print:
             # Safely format reward for logging (avoid huge dicts with teacher logprobs)
-            reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"<dict with {len(sample.reward)} keys>"
+            reward_summary = sample.reward
             logger.info(
                 "eval_rollout_single_dataset example data: "
                 f"{[str(sample.prompt) + sample.response]} "
