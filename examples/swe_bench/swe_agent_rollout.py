@@ -30,7 +30,6 @@ from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)  # Keep our own script logs at DEBUG level
 
 
 async def generate_rollout_swe_agent_async(
@@ -62,6 +61,13 @@ async def generate_rollout_swe_agent_async(
         Tuple of (RolloutFnTrainOutput, list of partial samples for data buffer)
     """
     assert args.rollout_global_dataset, "SWE-agent rollout requires global dataset"
+
+    # Clean up stale partial rollout containers before starting
+    # This removes containers older than 1 hour to prevent resource leaks
+    if args.partial_rollout:
+        from examples.swe_bench.generate_with_sweagent import cleanup_partial_rollout_containers
+
+        await cleanup_partial_rollout_containers(max_age_hours=1.0)
 
     # Initialize state
     state = GenerateState(args)
@@ -106,6 +112,7 @@ async def generate_rollout_swe_agent_async(
     # Track whether we should continue submitting
     can_submit_more = True
     data_source_exhausted = False
+    do_print_first_sample = True  # Flag to print first sample's detailed info
 
     while len(collected_samples) < target_sample_count:
         # Check time limit
@@ -140,6 +147,12 @@ async def generate_rollout_swe_agent_async(
                 # Unpack groups into individual samples and submit
                 for group in sample_groups:
                     for sample in group:
+                        # Generate unique session_id for container tracking
+                        # This allows multiple samples with same instance_id to have separate containers
+                        if sample.session_id is None:
+                            import uuid
+                            sample.session_id = str(uuid.uuid4())
+
                         # Create individual task for this sample
                         task = asyncio.create_task(
                             generate_and_rm(
@@ -164,7 +177,7 @@ async def generate_rollout_swe_agent_async(
                     if not can_submit_more:
                         break
 
-                logger.debug(
+                logger.info(
                     f"[SWE-Agent Rollout {rollout_id}] Submitted {submitted_count} tasks, "
                     f"{len(individual_tasks)} pending, {len(collected_samples)} collected"
                 )
@@ -239,6 +252,14 @@ async def generate_rollout_swe_agent_async(
             collected_samples.append(sample)
             pbar.update(1)
 
+            # Print detailed info for first sample (including reward)
+            if do_print_first_sample:
+                reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"Reward value: {sample.reward['reward']}, prompt_tokens: {sample.reward['meta_info']['prompt_tokens']}, completion_tokens: {sample.reward['meta_info']['completion_tokens']}, Input Token Logprobs: {sample.reward['meta_info']['input_token_logprobs'][:10]}, Output Token Logprobs: {sample.reward['meta_info']['output_token_logprobs'][:10]} "
+                logger.info(
+                    f"First rollout sample: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
+                )
+                do_print_first_sample = False
+
             logger.info(
                 f"[SWE-Agent Rollout {rollout_id}] Collected sample "
                 f"{len(collected_samples)}/{target_sample_count}: "
@@ -256,6 +277,14 @@ async def generate_rollout_swe_agent_async(
 
     pbar.close()
 
+    # Log the last collected sample with detailed info
+    if collected_samples:
+        sample = collected_samples[-1]
+        reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"Reward value: {sample.reward['reward']}, prompt_tokens: {sample.reward['meta_info']['prompt_tokens']}, completion_tokens: {sample.reward['meta_info']['completion_tokens']}, Input Token Logprobs: {sample.reward['meta_info']['input_token_logprobs'][:10]}, Output Token Logprobs: {sample.reward['meta_info']['output_token_logprobs'][:10]} "
+        logger.info(
+            f"Finish rollout: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
+        )
+
     # Phase 2: Abort remaining tasks and collect partial samples
     elapsed = time.time() - start_time
     logger.info(
@@ -270,15 +299,8 @@ async def generate_rollout_swe_agent_async(
         logger.info(f"[SWE-Agent Rollout {rollout_id}] Aborting {len(individual_tasks)} pending tasks...")
 
         # Mark state as aborted to stop new generations
+        # This signals to generate() functions to abort early
         state.aborted = True
-
-        # Send abort request to SGLang engines
-        try:
-            from slime.rollout.sglang_rollout import abort as abort_sglang_engines
-
-            await abort_sglang_engines(args, rollout_id)
-        except Exception as e:
-            logger.error(f"[SWE-Agent Rollout {rollout_id}] Failed to abort engines: {e}")
 
         # Collect results from aborted tasks (may have partial responses)
         aborted_count = 0
@@ -305,12 +327,17 @@ async def generate_rollout_swe_agent_async(
                         sample.metadata["start_rollout_id"] = rollout_id
                         partial_samples.append(sample)
                         partial_count += 1
-                        logger.debug(
+                        logger.info(
                             f"[SWE-Agent Rollout {rollout_id}] Saved partial sample: "
                             f"{sample.metadata.get('instance_id', 'unknown')}, "
                             f"response_length={sample.response_length}"
                         )
                     else:
+                        logger.info(
+                            f"[SWE-Agent Rollout {rollout_id}] Discarded partial sample: "
+                            f"{sample.metadata.get('instance_id', 'unknown')}, "
+                            f"response_length={sample.response_length}"
+                        )
                         aborted_count += 1
 
                 except Exception as e:
@@ -445,6 +472,11 @@ def generate_rollout_swe_agent(
     output, partial_samples = run(
         generate_rollout_swe_agent_async(args, rollout_id, data_source.get_samples, evaluation)
     )
+
+    logger.info(
+            f"[SWE-Agent Rollout {rollout_id}] Adding {len(partial_samples)} partial samples "
+            f"to data buffer"
+        )
 
     # Add partial samples back to data source buffer for next iteration
     # NOTE: Following the standard pattern from slime/rollout/sglang_rollout.py

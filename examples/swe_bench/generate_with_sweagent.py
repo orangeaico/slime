@@ -63,6 +63,87 @@ logger.setLevel(logging.INFO)
 # to avoid resource contention and runtime startup deadlocks
 _docker_startup_lock = asyncio.Lock()
 
+# Global registry for partial rollout Docker containers
+# Maps session_id -> {"env": SWEEnv, "agent": DefaultAgent, "instance_id": str, "rollout_id": int, "timestamp": float}
+# Uses session_id (unique per sample) instead of instance_id to support n-samples-per-prompt > 1
+# Note: No lock needed - asyncio event loop serializes access automatically
+_partial_rollout_containers = {}
+
+
+async def cleanup_partial_rollout_containers(max_age_hours: float = 1.0):
+    """
+    Clean up stale partial rollout containers.
+
+    Containers older than max_age_hours are closed to prevent resource leaks.
+    This should be called periodically (e.g., at the start of each rollout).
+
+    Args:
+        max_age_hours: Maximum age in hours before cleanup (default: 1 hour)
+    """
+    if not _partial_rollout_containers:
+        return
+
+    import time
+
+    logger.info(f"[Cleanup] Checking {len(_partial_rollout_containers)} partial rollout containers...")
+
+    current_time = time.time()
+    cutoff_time = current_time - (max_age_hours * 3600)
+    to_remove = []
+
+    for session_id, info in _partial_rollout_containers.items():
+        container_age_hours = (current_time - info["timestamp"]) / 3600
+        instance_id = info.get("instance_id", "unknown")
+
+        if info["timestamp"] < cutoff_time:
+            logger.info(
+                f"[Cleanup] Removing stale container: {instance_id} "
+                f"(session: {session_id[:8]}, age: {container_age_hours:.1f}h > {max_age_hours}h)"
+            )
+            try:
+                await info["env"].deployment.stop()
+                to_remove.append(session_id)
+            except Exception as e:
+                logger.error(f"[Cleanup] Error closing {instance_id} (session: {session_id[:8]}): {e}")
+                # Remove from registry anyway to prevent perpetual errors
+                to_remove.append(session_id)
+
+    for session_id in to_remove:
+        del _partial_rollout_containers[session_id]
+
+    if to_remove:
+        logger.info(
+            f"[Cleanup] Removed {len(to_remove)} stale containers. "
+            f"Remaining: {len(_partial_rollout_containers)}"
+        )
+    else:
+        logger.info(f"[Cleanup] No stale containers found")
+
+
+async def cleanup_all_partial_rollout_containers():
+    """
+    Clean up ALL partial rollout containers immediately.
+
+    Use this when shutting down or when you want to force cleanup of all containers.
+    """
+    if not _partial_rollout_containers:
+        logger.info("[Cleanup] No partial rollout containers to clean up")
+        return
+
+    logger.info(f"[Cleanup] Cleaning up ALL {len(_partial_rollout_containers)} partial rollout containers...")
+
+    for session_id, info in list(_partial_rollout_containers.items()):
+        instance_id = info.get("instance_id", "unknown")
+        try:
+            await info["env"].deployment.stop()
+            logger.debug(f"[Cleanup] Closed container: {instance_id} (session: {session_id[:8]})")
+        except Exception as e:
+            logger.error(f"[Cleanup] Error closing {instance_id} (session: {session_id[:8]}): {e}")
+
+    # Clear the entire registry
+    _partial_rollout_containers.clear()
+    logger.info("[Cleanup] ✓ All partial rollout containers cleaned up")
+
 
 class SlimeLLMModel(AbstractModel):
     """Custom LLM model that uses sglang chat completions API for slime training.
@@ -404,33 +485,63 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     """
     state = GenerateState(args)
 
-    # Handle partial rollout: skip samples that were already completed/aborted in previous iteration
-    # NOTE: Resuming partial SWE-agent samples is complex (requires Docker state restoration)
-    # For now, we skip them and they'll be retried as fresh instances
-    if args.partial_rollout and sample.response_length > 0:
-        logger.info(
-            f"[Slime-SWE] Skipping partial sample from previous rollout "
-            f"(SWE-agent resumption not yet implemented): "
-            f"{sample.metadata.get('instance_id', 'unknown')}"
-        )
-        # Return sample as-is (will be filtered out or retried fresh)
-        sample.status = Sample.Status.ABORTED
-        return sample
-
-    # Extract repo information from metadata
+    # Extract instance information
+    instance_id = sample.metadata.get("instance_id", "unknown")
     repo_name = sample.metadata.get("repo", "test/repo")
     base_commit = sample.metadata.get("base_commit", "HEAD")
-    instance_id = sample.metadata.get("instance_id", "unknown")
     image_name = sample.metadata.get("image_name", None)
     problem_statement = sample.prompt
 
-    logger.info(f"[Slime-SWE] Starting instance: {instance_id}")
-    # logger.info(f"[Slime-SWE] Repository: {repo_name}")
-    # logger.info(f"[Slime-SWE] Base commit: {base_commit}")
+    # Generate unique session_id if not present (for container tracking)
+    if sample.session_id is None:
+        import uuid
+        sample.session_id = str(uuid.uuid4())
 
-    # Initialize SWE environment
+    # Check if we can resume from a partial rollout container
     env = None
     agent = None
+    resuming_partial = False
+
+    if args.partial_rollout and sample.session_id in _partial_rollout_containers:
+        container_info = _partial_rollout_containers[sample.session_id]
+        env = container_info["env"]
+        agent = container_info["agent"]
+
+        logger.info(
+            f"[Slime-SWE] Resuming from partial rollout: {instance_id} "
+            f"(session: {sample.session_id[:8]}, "
+            f"previous rollout: {container_info['rollout_id']}, "
+            f"existing response length: {sample.response_length})"
+        )
+
+        # Remove from registry - we'll re-add if it becomes partial again
+        del _partial_rollout_containers[sample.session_id]
+
+        # Verify container is still alive - if dead, discard this partial sample
+        try:
+            # Quick health check - try to run a simple command
+            test_result = await _async_communicate(env, "echo test", timeout=5, check="ignore")
+            if "test" not in test_result:
+                raise RuntimeError("Container health check failed - unexpected output")
+
+            resuming_partial = True
+            logger.info(f"[Slime-SWE] ✓ Container health check passed")
+        except Exception as e:
+            logger.warning(
+                f"[Slime-SWE] Container dead for {instance_id}, discarding partial sample: {e}"
+            )
+            # Close dead container
+            try:
+                await env.deployment.stop()
+            except:
+                pass
+
+            # Mark sample as aborted - do NOT retry
+            sample.status = Sample.Status.ABORTED
+            sample.metadata["discard_reason"] = f"Dead container: {e}"
+            return sample
+    else:
+        logger.info(f"[Slime-SWE] Starting new instance: {instance_id}")
 
     try:
         # Check for abort before starting expensive Docker setup
@@ -439,151 +550,156 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             sample.status = Sample.Status.ABORTED
             return sample
 
-        # 1. Create repo config
-        if image_name and image_name.startswith("swebench/"):
-            # Pre-built SWE-bench images have the repo at /testbed
-            repo_config = PreExistingRepoConfig(
-                repo_name="testbed",
-                base_commit=base_commit,
-                reset=True,
-            )
-            working_dir = "/testbed"
-            logger.info(f"[Slime-SWE] Using pre-existing repo in SWE-bench image")
+        # If resuming partial, skip Docker setup (already have env and agent)
+        if resuming_partial:
+            logger.info(f"[Slime-SWE] Skipping Docker setup - using existing container")
+            # Jump to agent loop execution (env and agent already set)
         else:
-            # Clone from GitHub
-            if "/" in repo_name:
-                github_url = f"https://github.com/{repo_name}"
+            # 1. Create repo config
+            if image_name and image_name.startswith("swebench/"):
+                # Pre-built SWE-bench images have the repo at /testbed
+                repo_config = PreExistingRepoConfig(
+                    repo_name="testbed",
+                    base_commit=base_commit,
+                    reset=True,
+                )
+                working_dir = "/testbed"
+                logger.info(f"[Slime-SWE] Using pre-existing repo in SWE-bench image")
             else:
-                github_url = repo_name
+                # Clone from GitHub
+                if "/" in repo_name:
+                    github_url = f"https://github.com/{repo_name}"
+                else:
+                    github_url = repo_name
 
-            repo_config = GithubRepoConfig(
-                github_url=github_url,
-                base_commit=base_commit,
+                repo_config = GithubRepoConfig(
+                    github_url=github_url,
+                    base_commit=base_commit,
+                )
+                working_dir = f"/{repo_config.repo_name}"
+                logger.info(f"[Slime-SWE] Will clone from GitHub")
+
+            # 2. Create Docker deployment config
+            if image_name:
+                deployment_config = DockerDeploymentConfig(
+                    image=image_name,
+                    pull="never",
+                    startup_timeout=300.0,
+                    python_standalone_dir=None,
+                )
+                logger.info(f"[Slime-SWE] Using Docker image: {image_name}")
+            else:
+                deployment_config = DockerDeploymentConfig(
+                    image="python:3.11",
+                    startup_timeout=300.0,
+                )
+                logger.warning(f"[Slime-SWE] No image_name, using default python:3.11")
+
+            env_config = EnvironmentConfig(
+                repo=repo_config,
+                deployment=deployment_config,
             )
-            working_dir = f"/{repo_config.repo_name}"
-            logger.info(f"[Slime-SWE] Will clone from GitHub")
 
-        # 2. Create Docker deployment config
-        if image_name:
-            deployment_config = DockerDeploymentConfig(
-                image=image_name,
-                pull="never",
-                startup_timeout=300.0,
-                python_standalone_dir=None,
-            )
-            logger.info(f"[Slime-SWE] Using Docker image: {image_name}")
-        else:
-            deployment_config = DockerDeploymentConfig(
-                image="python:3.11",
-                startup_timeout=300.0,
-            )
-            logger.warning(f"[Slime-SWE] No image_name, using default python:3.11")
+            # 3. Create SWEEnv
+            logger.debug(f"[Slime-SWE] Creating SWEEnv...")
+            env = SWEEnv.from_config(env_config)
 
-        env_config = EnvironmentConfig(
-            repo=repo_config,
-            deployment=deployment_config,
-        )
-
-        # 3. Create SWEEnv
-        logger.debug(f"[Slime-SWE] Creating SWEEnv...")
-        env = SWEEnv.from_config(env_config)
-
-        # Check for abort before expensive Docker startup
-        if state.aborted:
-            logger.info(f"[Slime-SWE] ⚠ Abort detected before Docker startup, skipping")
-            sample.status = Sample.Status.ABORTED
-            return sample
-
-        # Serialize Docker container startups to prevent concurrent health check deadlocks
-        logger.info(f"[Slime-SWE] Waiting for Docker startup lock...")
-        async with _docker_startup_lock:
-            # Check abort again after acquiring lock (might have been aborted while waiting)
+            # Check for abort before expensive Docker startup
             if state.aborted:
-                logger.info(f"[Slime-SWE] ⚠ Abort detected after acquiring lock, skipping startup")
+                logger.info(f"[Slime-SWE] ⚠ Abort detected before Docker startup, skipping")
                 sample.status = Sample.Status.ABORTED
                 return sample
 
-            logger.info(f"[Slime-SWE] Lock acquired, starting environment...")
-            await _async_env_start(env, state)  # Pass state for abort checking
-            logger.info(f"[Slime-SWE] ✓ Environment ready, releasing lock")
+            # Serialize Docker container startups to prevent concurrent health check deadlocks
+            logger.info(f"[Slime-SWE] Waiting for Docker startup lock...")
+            async with _docker_startup_lock:
+                # Check abort again after acquiring lock (might have been aborted while waiting)
+                if state.aborted:
+                    logger.info(f"[Slime-SWE] ⚠ Abort detected after acquiring lock, skipping startup")
+                    sample.status = Sample.Status.ABORTED
+                    return sample
 
-        # 4. Load SWE-agent configuration from YAML
-        config_path = Path("/root/swe_livup/config/test_xml_v2.yaml")
-        with open(config_path) as f:
-            swe_config_yaml = yaml.safe_load(f)
+                logger.info(f"[Slime-SWE] Lock acquired, starting environment...")
+                await _async_env_start(env, state)  # Pass state for abort checking
+                logger.info(f"[Slime-SWE] ✓ Environment ready, releasing lock")
 
-        # Parse agent config
-        agent_config_dict = swe_config_yaml.get("agent", {})
+            # 4. Load SWE-agent configuration from YAML
+            config_path = Path("/root/swe_livup/config/test_xml_v2.yaml")
+            with open(config_path) as f:
+                swe_config_yaml = yaml.safe_load(f)
 
-        # Override model config with sglang settings
-        agent_config_dict["model"] = {
-            "name": "sglang",
-            "temperature": sampling_params.get("temperature", 0.7) if isinstance(sampling_params, dict) else 0.7,
-            "top_p": sampling_params.get("top_p", 1.0) if isinstance(sampling_params, dict) else 1.0,
-        }
+            # Parse agent config
+            agent_config_dict = swe_config_yaml.get("agent", {})
 
-        # Create DefaultAgentConfig from YAML
-        agent_config = DefaultAgentConfig(**agent_config_dict)
+            # Override model config with sglang settings
+            agent_config_dict["model"] = {
+                "name": "sglang",
+                "temperature": sampling_params.get("temperature", 0.7) if isinstance(sampling_params, dict) else 0.7,
+                "top_p": sampling_params.get("top_p", 1.0) if isinstance(sampling_params, dict) else 1.0,
+            }
 
-        logger.debug(f"[Slime-SWE] Loaded agent config from YAML")
+            # Create DefaultAgentConfig from YAML
+            agent_config = DefaultAgentConfig(**agent_config_dict)
 
-        # 5. Create custom model instance
-        # We need to manually create the model since we're using a custom class
-        model = SlimeLLMModel(config=agent_config.model, tools=agent_config.tools)
-        model.args = args  # Store args for abort checking
-        model.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/chat/completions"
-        model.sglang_model_name = "/root/data/hf_models/Qwen3-1.7B"
-        model.tokenizer = state.tokenizer
+            logger.debug(f"[Slime-SWE] Loaded agent config from YAML")
 
-        logger.debug(f"[Slime-SWE] Created SlimeLLMModel")
+            # 5. Create custom model instance
+            # We need to manually create the model since we're using a custom class
+            model = SlimeLLMModel(config=agent_config.model, tools=agent_config.tools)
+            model.args = args  # Store args for abort checking
+            model.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/chat/completions"
+            model.sglang_model_name = "/root/data/hf_models/Qwen3-1.7B"
+            model.tokenizer = state.tokenizer
 
-        # 6. Create agent manually (bypass from_config to use our custom model)
-        from sweagent.tools.tools import ToolHandler
+            logger.debug(f"[Slime-SWE] Created SlimeLLMModel")
 
-        agent = DefaultAgent(
-            templates=agent_config.templates,
-            tools=ToolHandler(agent_config.tools),
-            history_processors=agent_config.history_processors,
-            model=model,
-            max_requeries=agent_config.max_requeries,
-            action_sampler_config=agent_config.action_sampler,
-            interventions=agent_config.interventions,
-        )
+            # 6. Create agent manually (bypass from_config to use our custom model)
+            from sweagent.tools.tools import ToolHandler
 
-        logger.info(f"[Slime-SWE] Created DefaultAgent")
+            agent = DefaultAgent(
+                templates=agent_config.templates,
+                tools=ToolHandler(agent_config.tools),
+                history_processors=agent_config.history_processors,
+                model=model,
+                max_requeries=agent_config.max_requeries,
+                action_sampler_config=agent_config.action_sampler,
+                interventions=agent_config.interventions,
+            )
 
-        # 7. Build initial prompts (before agent initialization)
-        system_template = agent_config.templates.system_template
-        instance_template = agent_config.templates.instance_template
+            logger.info(f"[Slime-SWE] Created DefaultAgent")
 
-        # Replace placeholders
-        from sweagent.tools.utils import generate_command_docs
-        command_docs = generate_command_docs(
-            commands=agent.tools.config.commands,
-            subroutine_types=[],
-        )
-        system_prompt = system_template.replace("{{command_docs}}", command_docs)
-        instance_prompt = instance_template.replace("{{working_dir}}", working_dir)
-        instance_prompt = instance_prompt.replace("{{problem_statement}}", problem_statement)
+            # 7. Build initial prompts (before agent initialization)
+            system_template = agent_config.templates.system_template
+            instance_template = agent_config.templates.instance_template
 
-        logger.debug(f"[Slime-SWE] Built system and instance prompts")
+            # Replace placeholders
+            from sweagent.tools.utils import generate_command_docs
+            command_docs = generate_command_docs(
+                commands=agent.tools.config.commands,
+                subroutine_types=[],
+            )
+            system_prompt = system_template.replace("{{command_docs}}", command_docs)
+            instance_prompt = instance_template.replace("{{working_dir}}", working_dir)
+            instance_prompt = instance_prompt.replace("{{problem_statement}}", problem_statement)
 
-        # 8. Manual agent initialization (avoid asyncio.run() conflict)
-        problem_stmt = TextProblemStatement(
-            id=instance_id,
-            text=problem_statement,
-        )
+            logger.debug(f"[Slime-SWE] Built system and instance prompts")
 
-        output_dir = Path("/root/repo/slime/outputs/swe_agent_trajectories") / instance_id
-        output_dir.mkdir(parents=True, exist_ok=True)
+            # 8. Manual agent initialization (avoid asyncio.run() conflict)
+            problem_stmt = TextProblemStatement(
+                id=instance_id,
+                text=problem_statement,
+            )
 
-        logger.debug(f"[Slime-SWE] Setting up agent for background thread execution...")
+            output_dir = Path("/root/repo/slime/outputs/swe_agent_trajectories") / instance_id
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Build initial messages for later use in tokenization
-        setup_messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": instance_prompt}
-        ]
+            logger.debug(f"[Slime-SWE] Setting up agent for background thread execution...")
+
+            # Build initial messages for later use in tokenization
+            setup_messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": instance_prompt}
+            ]
 
         # Define the agent loop function that runs in a separate thread
         # This allows swe-agent to use asyncio.run() freely without conflicts
@@ -926,12 +1042,45 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         return sample
 
     finally:
-        # Always close environment if it was initialized
+        # Handle environment cleanup based on sample status
         if env is not None:
-            try:
-                logger.info(f"[Slime-SWE] Closing Docker environment...")
-                await env.deployment.stop()
-                logger.info(f"[Slime-SWE] ✓ Environment closed")
-            except Exception as e:
-                logger.error(f"[Slime-SWE] ✗ Error closing environment: {e}")
-                logger.exception(e)
+            # Check if this sample should be kept alive for partial rollout resumption
+            should_keep_alive = (
+                args.partial_rollout
+                and sample.status == Sample.Status.ABORTED
+                and sample.response
+                and len(sample.response) > 0
+            )
+
+            if should_keep_alive:
+                # Save environment and agent for next rollout
+                import time
+
+                logger.info(
+                    f"[Slime-SWE] Keeping Docker container alive for partial rollout: "
+                    f"{instance_id} (session: {sample.session_id[:8]}, "
+                    f"response_length={sample.response_length})"
+                )
+
+                # Store in global registry using session_id (unique per sample)
+                _partial_rollout_containers[sample.session_id] = {
+                    "env": env,
+                    "agent": agent,
+                    "instance_id": instance_id,  # For logging/debugging
+                    "rollout_id": sample.metadata.get("start_rollout_id", -1),
+                    "timestamp": time.time(),
+                }
+
+                logger.info(
+                    f"[Slime-SWE] ✓ Container saved to registry (key: {sample.session_id[:8]}). "
+                    f"Total active containers: {len(_partial_rollout_containers)}"
+                )
+            else:
+                # Close environment for completed/failed samples
+                try:
+                    logger.info(f"[Slime-SWE] Closing Docker environment...")
+                    await env.deployment.stop()
+                    logger.info(f"[Slime-SWE] ✓ Environment closed")
+                except Exception as e:
+                    logger.error(f"[Slime-SWE] ✗ Error closing environment: {e}")
+                    logger.exception(e)
