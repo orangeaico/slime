@@ -18,13 +18,14 @@ import asyncio
 import logging
 import time
 from argparse import Namespace
-from typing import Callable
+from typing import Any, Callable
 
 from tqdm import tqdm
 
 from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm
+from slime.utils.async_utils import run
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
@@ -32,12 +33,12 @@ logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)  # Keep our own script logs at DEBUG level
 
 
-async def generate_rollout_swe_agent(
+async def generate_rollout_swe_agent_async(
     args: Namespace,
     rollout_id: int,
-    data_source: Callable[[int], list[list[Sample]]],
+    data_source_get_samples: Callable[[int], list[list[Sample]]],
     evaluation: bool = False,
-) -> RolloutFnTrainOutput:
+) -> tuple[RolloutFnTrainOutput, list[Sample]]:
     """
     Time-bounded rollout collection for SWE-agent with variable-duration tasks.
 
@@ -54,11 +55,11 @@ async def generate_rollout_swe_agent(
             - n_samples_per_prompt: Logical grouping (for best-of-N analysis)
             - over_sampling_batch_size: Samples to request per batch
         rollout_id: Current rollout iteration
-        data_source: Function to fetch sample groups from dataset
+        data_source_get_samples: Function to fetch sample groups from dataset
         evaluation: Whether this is evaluation (not used for training)
 
     Returns:
-        RolloutFnTrainOutput with collected samples and metrics
+        Tuple of (RolloutFnTrainOutput, list of partial samples for data buffer)
     """
     assert args.rollout_global_dataset, "SWE-agent rollout requires global dataset"
 
@@ -126,7 +127,7 @@ async def generate_rollout_swe_agent(
         ):
             # Fetch batch of sample groups from data source
             try:
-                sample_groups = data_source(args.over_sampling_batch_size)
+                sample_groups = data_source_get_samples(args.over_sampling_batch_size)
             except Exception as e:
                 logger.warning(
                     f"[SWE-Agent Rollout {rollout_id}] Data source exhausted after "
@@ -208,7 +209,7 @@ async def generate_rollout_swe_agent(
 
             # Check sample status
             if sample.status == Sample.Status.ABORTED:
-                logger.debug(
+                logger.info(
                     f"[SWE-Agent Rollout {rollout_id}] Sample aborted: "
                     f"{sample.metadata.get('instance_id', 'unknown')}"
                 )
@@ -238,7 +239,7 @@ async def generate_rollout_swe_agent(
             collected_samples.append(sample)
             pbar.update(1)
 
-            logger.debug(
+            logger.info(
                 f"[SWE-Agent Rollout {rollout_id}] Collected sample "
                 f"{len(collected_samples)}/{target_sample_count}: "
                 f"{sample.metadata.get('instance_id', 'unknown')}, "
@@ -362,11 +363,13 @@ async def generate_rollout_swe_agent(
     # Reset state for next rollout
     state.reset()
 
-    # Return collected samples and metrics
-    return RolloutFnTrainOutput(
+    # Return collected samples, metrics, and partial samples for data buffer
+    output = RolloutFnTrainOutput(
         samples=collected_samples,
         metrics=metric_gatherer.collect(),
     )
+
+    return output, partial_samples
 
 
 def _analyze_best_of_n(samples: list[Sample], n_per_prompt: int) -> dict:
@@ -413,31 +416,63 @@ def _analyze_best_of_n(samples: list[Sample], n_per_prompt: int) -> dict:
     return analysis
 
 
-def _save_partial_samples_to_buffer(args: Namespace, partial_samples: list[Sample], rollout_id: int):
+def generate_rollout_swe_agent(
+    args: Namespace,
+    rollout_id: int,
+    data_source: Any,
+    evaluation: bool = False,
+) -> RolloutFnTrainOutput:
     """
-    Save partial samples to data source buffer for next iteration.
+    Wrapper function for SWE-agent rollout that handles partial sample buffering.
 
-    These samples will be loaded in the next rollout and resumed from
-    where they left off (partial-rollout mode).
+    This function:
+    1. Calls the async rollout function
+    2. Adds partial (aborted) samples back to data source for next iteration
+    3. Returns the final output for training
+
+    Args:
+        args: Training arguments
+        rollout_id: Current rollout iteration
+        data_source: Data source object with get_samples() and add_samples() methods
+        evaluation: Whether this is evaluation mode
+
+    Returns:
+        RolloutFnTrainOutput with collected samples and metrics
     """
-    if not partial_samples:
-        return
+    assert args.rollout_global_dataset, "SWE-agent rollout requires global dataset"
 
-    try:
-        # This requires data source to support adding samples back
-        # Implementation depends on your data source type
+    # Run async rollout and collect partial samples
+    output, partial_samples = run(
+        generate_rollout_swe_agent_async(args, rollout_id, data_source.get_samples, evaluation)
+    )
+
+    # Add partial samples back to data source buffer for next iteration
+    # NOTE: Following the standard pattern from slime/rollout/sglang_rollout.py
+    if partial_samples and args.partial_rollout:
         logger.info(
-            f"[SWE-Agent Rollout {rollout_id}] Saving {len(partial_samples)} partial samples to buffer"
+            f"[SWE-Agent Rollout {rollout_id}] Adding {len(partial_samples)} partial samples "
+            f"to data buffer for next iteration"
         )
 
-        # Mark samples for partial rollout
-        for sample in partial_samples:
-            # Mask previous tokens (don't train on them in next iteration)
-            if args.mask_offpolicy_in_partial_rollout and sample.loss_mask:
-                sample.loss_mask = [0] * len(sample.loss_mask)
+        # Prepare partial samples for next rollout
+        # When mask_offpolicy_in_partial_rollout is enabled, mask previous generation
+        # so training only happens on new tokens generated in next iteration
+        if args.mask_offpolicy_in_partial_rollout:
+            for sample in partial_samples:
+                if sample.loss_mask:
+                    # Mask all existing tokens - they're off-policy now
+                    sample.loss_mask = [0] * len(sample.loss_mask)
 
-        # TODO: Implement data source interface for adding partial samples
-        # data_source.add_partial_samples(partial_samples)
+        # Group partial samples (data source expects groups)
+        # For SWE-agent, each sample is independent, so wrap in single-element lists
+        partial_groups = [[sample] for sample in partial_samples]
 
-    except Exception as e:
-        logger.error(f"[SWE-Agent Rollout {rollout_id}] Failed to save partial samples: {e}")
+        # Add back to data source
+        data_source.add_samples(partial_groups)
+
+        logger.info(
+            f"[SWE-Agent Rollout {rollout_id}] ✓ {len(partial_samples)} partial samples added to buffer. "
+            f"Note: SWE-agent resumption requires Docker state restoration (not yet implemented)."
+        )
+
+    return output

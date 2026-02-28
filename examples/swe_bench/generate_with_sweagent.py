@@ -402,9 +402,20 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     Returns:
         Sample with response, tokens, and loss_mask filled in
     """
-    assert not args.partial_rollout, "Partial rollout is not supported for this function."
-
     state = GenerateState(args)
+
+    # Handle partial rollout: skip samples that were already completed/aborted in previous iteration
+    # NOTE: Resuming partial SWE-agent samples is complex (requires Docker state restoration)
+    # For now, we skip them and they'll be retried as fresh instances
+    if args.partial_rollout and sample.response_length > 0:
+        logger.info(
+            f"[Slime-SWE] Skipping partial sample from previous rollout "
+            f"(SWE-agent resumption not yet implemented): "
+            f"{sample.metadata.get('instance_id', 'unknown')}"
+        )
+        # Return sample as-is (will be filtered out or retried fresh)
+        sample.status = Sample.Status.ABORTED
+        return sample
 
     # Extract repo information from metadata
     repo_name = sample.metadata.get("repo", "test/repo")
