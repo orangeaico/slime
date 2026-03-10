@@ -12,11 +12,11 @@ set -ex
 
 # Start the teacher model server
 TEACHER_IP="127.0.0.1"
-TEACHER_PORT=4600
+TEACHER_PORT=4500
 LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
 # CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server \
-#     --model-path /root/data/hf_models/Qwen3-1.7B \
+#     --model-path /root/data/hf_models/Qwen3-0.6B \
 #     --host 0.0.0.0 \
 #     --port $TEACHER_PORT \
 #     --tp 1 \
@@ -33,8 +33,8 @@ LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 #     sleep 5
 # done
 
-# curl http://$TEACHER_IP:$TEACHER_PORT/get_model_info
-# echo "Teacher model server is up and running at $TEACHER_IP:$TEACHER_PORT."
+curl http://$TEACHER_IP:$TEACHER_PORT/get_model_info
+echo "Teacher model server is up and running at $TEACHER_IP:$TEACHER_PORT."
 # sleep 10
 
 
@@ -61,16 +61,16 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/repo/slime/scripts/models/qwen3-1.7B.sh"
+source "/root/repo/slime/scripts/models/qwen3-0.6B.sh"
 
 
 CKPT_ARGS=(
-   --hf-checkpoint /root/data/himanshu/output/hf_models_converted/qwen3_1.7b/swe_bench_472_trajs_10_epochs
-   --ref-load /root/data/mega-models/Qwen3-1.7B
-   # --load /root/data/mega-models/Qwen3-1.7B_swe_bench/
+   --hf-checkpoint /root/data/hf_models/Qwen3-0.6B
+   --ref-load /root/data/mega-models/Qwen3-0.6B
+   # --load /root/data/mega-models/Qwen3-0.6B_swe_bench/
    # --no-load-rng
    # --no-load-optim
-   --save /root/data/mega-models/Qwen3-1.7B_swe_bench/
+   --save /root/data/mega-models/Qwen3-0.6B_swe_bench/
    --no-save-optim
    --no-save-rng
    --save-interval 10
@@ -80,9 +80,13 @@ CUSTOM_ARGS=(
    # Multi-turn generate function using proper SWE-agent DefaultAgent integration
    --custom-generate-function-path examples.swe_bench.generate_with_sweagent.generate
 
+   # Time-bounded rollout for variable-duration SWE-agent tasks
+   --rollout-function-path examples.swe_bench.swe_agent_rollout.generate_rollout_swe_agent
+
    # Reward functions for pure distillation
    --custom-rm-path examples.swe_bench.reward.reward_func
    --custom-reward-post-process-path examples.swe_bench.reward.post_process_rewards
+   --reward-key reward  # Extract scalar reward from dict for metrics computation
 
    # OPD requires rm-url for teacher log-probs
    --rm-url http://$TEACHER_IP:$TEACHER_PORT/generate
@@ -94,12 +98,20 @@ ROLLOUT_ARGS=(
    # Don't apply chat template - we handle it in generate.py
    --rollout-shuffle
    --num-rollout 50
-   --rollout-batch-size 1  # REDUCED: 2->1 to avoid simultaneous Docker startups
-   --n-samples-per-prompt 2  # REDUCED: 2->1 to avoid resource contention
+
+   # Time-bounded rollout for variable-duration tasks
+   --rollout-batch-size 2  # Number of samples to collect (increase to 64 for scale)
+   --n-samples-per-prompt 1  # Samples per issue (increase to 4 for best-of-N)
+   --rollout-max-time-minutes 10  # Max time per rollout (10 min default)
+   --rollout-over-provision-factor 4  # Submit 4x samples to handle variance
+   --partial-rollout  # Enable saving/resuming partial samples
+   --mask-offpolicy-in-partial-rollout  # Mask old tokens in resumed samples
+
    --rollout-max-response-len 4096  # Long context for multi-turn
    --rollout-temperature 0.8
+   --over-sampling-batch-size 8  # Fetch samples in batches of 8
 
-   --global-batch-size 2
+   --global-batch-size 2  # For training (increase to 64 for scale)
    --balance-data
 )
 

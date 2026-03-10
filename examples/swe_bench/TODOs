@@ -1,0 +1,18 @@
+# TODOs
+
+# Basic testing with math dataset on local GPUs with all components (teacher, rollout engine and training) running locally - Done
+# Integration with SWE agent AbstractModel to reuse sweagent trajectory management functionality - Done
+# Docker enviroment and tools setup in generate function - Done
+# Conversion of sweagent history to properly formatted text for training and loss mask for making only assistant tokens trainable - Done
+
+# Time based rollout interruption - Done
+# Over generate rollout samples to use completed samples uptil a certain point of time for training. Tradeoff - off policy data for a lot of samples - Done
+
+# SWE agent custom generate function to actually get interrupted on abort command - Done
+# Save partial samples in data buffer and use them in next rollout - Done
+# Partial rollout management in generate function by saving and resuming docker state - Done (Verification pending, needs parallel dockers to work)
+# Filter trajectories based on completion and optionally based on bug resolution
+# Mirror patch and test mirror patch integration
+# Multiple docker runs together with high throughput
+# Additional files created by sweagent such as info.log, preds.json, exit status yaml, etc
+
