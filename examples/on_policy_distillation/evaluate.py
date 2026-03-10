@@ -142,6 +142,7 @@ def generate_response(
     temperature: float = 0.7,
     do_sample: bool = True,
     sample_idx: int = 0,
+    add_wrapper: bool = False,
 ) -> str:
     """Generate a response from the model."""
     logger.info(f"[Sample {sample_idx}] Preparing prompt...")
@@ -151,10 +152,12 @@ def generate_response(
         # Prompt is already in chat format - wrap the content of the last user message
         messages = prompt.copy()
         if messages[-1].get("role") == "user":
-            messages[-1]["content"] = add_prompt_wrapper(messages[-1]["content"])
+            if add_wrapper:
+                messages[-1]["content"] = add_prompt_wrapper(messages[-1]["content"])
     else:
-        # Wrap plain text in user message and add prefix/suffix
-        messages = [{"role": "user", "content": add_prompt_wrapper(prompt)}]
+        # Wrap plain text in user message and optionally add prefix/suffix
+        content = add_prompt_wrapper(prompt) if add_wrapper else prompt
+        messages = [{"role": "user", "content": content}]
 
     logger.info(f"[Sample {sample_idx}] Tokenizing input...")
     # Tokenize with chat template
@@ -199,6 +202,7 @@ def generate_response_vllm(
     max_new_tokens: int = 2048,
     temperature: float = 0.7,
     sample_idx: int = 0,
+    add_wrapper: bool = False,
 ) -> str:
     """Generate a response using vLLM server API."""
     logger.info(f"[Sample {sample_idx}] Preparing vLLM API request...")
@@ -208,10 +212,12 @@ def generate_response_vllm(
         # Prompt is already in chat format - wrap the content of the last user message
         messages = prompt.copy()
         if messages[-1].get("role") == "user":
-            messages[-1]["content"] = add_prompt_wrapper(messages[-1]["content"])
+            if add_wrapper:
+                messages[-1]["content"] = add_prompt_wrapper(messages[-1]["content"])
     else:
-        # Wrap plain text in user message and add prefix/suffix
-        messages = [{"role": "user", "content": add_prompt_wrapper(prompt)}]
+        # Wrap plain text in user message and optionally add prefix/suffix
+        content = add_prompt_wrapper(prompt) if add_wrapper else prompt
+        messages = [{"role": "user", "content": content}]
 
     # Prepare API request
     url = f"http://localhost:{port}/v1/chat/completions"
@@ -294,6 +300,7 @@ def process_single_sample(
     use_vllm: bool,
     vllm_port: int,
     vllm_model_name: str,
+    add_wrapper: bool = False,
     model: Any = None,
     tokenizer: Any = None,
 ) -> dict[str, Any]:
@@ -311,6 +318,7 @@ def process_single_sample(
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
                 sample_idx=idx,
+                add_wrapper=add_wrapper,
             )
         else:
             response, input_tokens, output_tokens = generate_response(
@@ -319,6 +327,7 @@ def process_single_sample(
                 temperature=temperature,
                 do_sample=do_sample,
                 sample_idx=idx,
+                add_wrapper=add_wrapper,
             )
 
         # Extract answer from response
@@ -366,6 +375,8 @@ def evaluate(
     vllm_port: int = 9000,
     vllm_model_name: str = "qwen3",
     vllm_workers: int = 20,
+    attempts: int = 1,
+    add_wrapper: bool = False,
 ) -> dict[str, Any]:
     """Run evaluation on the dataset."""
 
@@ -416,11 +427,11 @@ def evaluate(
     # Load dataset
     samples = load_dataset(dataset_path, num_samples)
     logger.info(f"Will evaluate on {len(samples)} samples")
+    logger.info(f"Running {attempts} attempt(s)")
 
-    # Evaluation loop
-    results = []
-    correct = 0
-    total = 0
+    # Initialize tracking structures for multiple attempts
+    per_sample_results = {i: [] for i in range(len(samples))}  # Track all attempts per sample
+    all_results = []
 
     logger.info("="*60)
     logger.info("Starting evaluation...")
@@ -428,15 +439,56 @@ def evaluate(
         logger.info(f"Using parallel processing with {vllm_workers} workers")
     logger.info("="*60)
 
-    # Use parallel processing for vLLM mode with multiple workers
-    if use_vllm and vllm_workers > 1:
-        logger.info(f"Processing {len(samples)} samples in parallel with {vllm_workers} workers...")
+    # Run evaluation for multiple attempts
+    for attempt_num in range(attempts):
+        logger.info(f"\n{'='*60}")
+        logger.info(f"ATTEMPT {attempt_num + 1}/{attempts}")
+        logger.info(f"{'='*60}\n")
 
-        with ThreadPoolExecutor(max_workers=vllm_workers) as executor:
-            # Submit all tasks
-            future_to_idx = {
-                executor.submit(
-                    process_single_sample,
+        # Use parallel processing for vLLM mode with multiple workers
+        if use_vllm and vllm_workers > 1:
+            logger.info(f"Processing {len(samples)} samples in parallel with {vllm_workers} workers...")
+
+            with ThreadPoolExecutor(max_workers=vllm_workers) as executor:
+                # Submit all tasks
+                future_to_idx = {
+                    executor.submit(
+                        process_single_sample,
+                        idx=idx,
+                        sample=sample,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        do_sample=do_sample,
+                        use_vllm=use_vllm,
+                        vllm_port=vllm_port,
+                        vllm_model_name=vllm_model_name,
+                        add_wrapper=add_wrapper,
+                        model=model,
+                        tokenizer=tokenizer,
+                    ): idx
+                    for idx, sample in enumerate(samples)
+                }
+
+                # Collect results as they complete
+                attempt_results = {}
+                completed = 0
+                for future in as_completed(future_to_idx):
+                    idx = future_to_idx[future]
+                    result = future.result()
+                    attempt_results[idx] = result
+                    per_sample_results[idx].append(result)
+                    all_results.append(result)
+                    completed += 1
+
+                    # Log progress
+                    logger.info(f"Attempt {attempt_num + 1} - Completed {completed}/{len(samples)}")
+
+        else:
+            # Sequential processing for HuggingFace mode or single worker vLLM
+            for idx, sample in enumerate(samples):
+                logger.info(f"\nAttempt {attempt_num + 1} - Processing sample {idx + 1}/{len(samples)}")
+
+                result = process_single_sample(
                     idx=idx,
                     sample=sample,
                     max_new_tokens=max_new_tokens,
@@ -445,77 +497,41 @@ def evaluate(
                     use_vllm=use_vllm,
                     vllm_port=vllm_port,
                     vllm_model_name=vllm_model_name,
+                    add_wrapper=add_wrapper,
                     model=model,
                     tokenizer=tokenizer,
-                ): idx
-                for idx, sample in enumerate(samples)
-            }
+                )
 
-            # Collect results as they complete
-            completed = 0
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                result = future.result()
-                results.append(result)
-
-                if result.get("correct", False):
-                    correct += 1
-                total += 1
-                completed += 1
-
-                # Log progress
-                current_acc = correct / total * 100
-                logger.info(f"Completed {completed}/{len(samples)} | Running accuracy: {correct}/{total} = {current_acc:.2f}%")
-
-        # Sort results by idx to maintain order
-        results.sort(key=lambda x: x["idx"])
-
-    else:
-        # Sequential processing for HuggingFace mode or single worker vLLM
-        for idx, sample in enumerate(samples):
-            logger.info(f"\n{'='*60}")
-            logger.info(f"Processing sample {idx + 1}/{len(samples)}")
-            logger.info(f"{'='*60}")
-
-            result = process_single_sample(
-                idx=idx,
-                sample=sample,
-                max_new_tokens=max_new_tokens,
-                temperature=temperature,
-                do_sample=do_sample,
-                use_vllm=use_vllm,
-                vllm_port=vllm_port,
-                vllm_model_name=vllm_model_name,
-                model=model,
-                tokenizer=tokenizer,
-            )
-
-            results.append(result)
-
-            if result.get("correct", False):
-                correct += 1
-            total += 1
-
-            # Log progress summary
-            current_acc = correct / total * 100
-            logger.info(f"[Sample {idx}] Running accuracy: {correct}/{total} = {current_acc:.2f}%")
+                per_sample_results[idx].append(result)
+                all_results.append(result)
 
     # Compute final metrics
-    accuracy = correct / total * 100 if total > 0 else 0
+    total = len(samples)
 
-    # Calculate token statistics
-    total_input_tokens = sum(r.get("input_tokens", 0) for r in results)
-    total_output_tokens = sum(r.get("output_tokens", 0) for r in results)
-    avg_input_tokens = total_input_tokens / total if total > 0 else 0
-    avg_output_tokens = total_output_tokens / total if total > 0 else 0
+    # Pass@k: number of samples that got at least one correct answer across all attempts
+    pass_at_k = sum(1 for idx in range(total) if any(r.get("correct", False) for r in per_sample_results[idx]))
+
+    # Avg@k: average number of correct answers per sample across all attempts
+    avg_at_k = sum(sum(1 for r in per_sample_results[idx] if r.get("correct", False)) for idx in range(total)) / total if total > 0 else 0
+
+    # Overall accuracy across all attempts
+    total_correct = sum(1 for r in all_results if r.get("correct", False))
+    overall_accuracy = total_correct / len(all_results) * 100 if all_results else 0
+
+    # Calculate token statistics from all attempts
+    total_input_tokens = sum(r.get("input_tokens", 0) for r in all_results)
+    total_output_tokens = sum(r.get("output_tokens", 0) for r in all_results)
+    avg_input_tokens = total_input_tokens / len(all_results) if all_results else 0
+    avg_output_tokens = total_output_tokens / len(all_results) if all_results else 0
 
     logger.info("\n" + "="*60)
     logger.info("Evaluation Complete!")
     logger.info("="*60)
     logger.info(f"Total samples: {total}")
-    logger.info(f"Correct: {correct}")
-    logger.info(f"Incorrect: {total - correct}")
-    logger.info(f"Accuracy: {accuracy:.2f}%")
+    logger.info(f"Number of attempts: {attempts}")
+    logger.info(f"Pass@k (samples with >=1 correct): {pass_at_k}/{total}")
+    logger.info(f"Avg@k (average correct per sample across {attempts} attempts): {avg_at_k:.2f}")
+    logger.info(f"Overall accuracy (all attempts): {overall_accuracy:.2f}%")
     logger.info(f"Average input tokens: {avg_input_tokens:.1f}")
     logger.info(f"Average output tokens: {avg_output_tokens:.1f}")
     logger.info(f"Total input tokens: {total_input_tokens}")
@@ -524,9 +540,11 @@ def evaluate(
 
     summary = {
         "total_samples": total,
-        "correct": correct,
-        "incorrect": total - correct,
-        "accuracy": accuracy,
+        "num_attempts": attempts,
+        "pass_at_k": pass_at_k,
+        "pass_at_k_percentage": pass_at_k / total * 100 if total > 0 else 0,
+        "avg_at_k": avg_at_k,
+        "overall_accuracy_percentage": overall_accuracy,
         "avg_input_tokens": avg_input_tokens,
         "avg_output_tokens": avg_output_tokens,
         "total_input_tokens": total_input_tokens,
@@ -542,8 +560,94 @@ def evaluate(
 
     return {
         "summary": summary,
-        "results": results,
+        "results": all_results,
+        "samples": samples,
+        "per_sample_results": per_sample_results,
     }
+
+
+def write_pass_rate_files(
+    samples: list[dict[str, Any]],
+    per_sample_results: dict[int, list[dict[str, Any]]],
+    attempts: int,
+    output_dir: str = ".",
+) -> None:
+    """
+    Write 3 output files based on pass rates when multiple attempts are used.
+
+    Files created:
+    1. {output_dir}/pass_rate_1.0.jsonl - Samples with 100% pass rate
+    2. {output_dir}/pass_rate_0.0.jsonl - Samples with 0% pass rate
+    3. {output_dir}/pass_rate_partial.jsonl - Samples with 0 < pass_rate < 1, sorted by pass rate (lowest first)
+    """
+    if attempts <= 1:
+        logger.info("Skipping pass rate files - only 1 attempt")
+        return
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    full_pass = []
+    no_pass = []
+    partial_pass = []
+
+    # Categorize samples by pass rate
+    for idx in range(len(samples)):
+        sample = samples[idx].copy()
+
+        # Calculate pass rate for this sample
+        correct_count = sum(1 for r in per_sample_results[idx] if r.get("correct", False))
+        pass_rate = correct_count / attempts
+
+        # Add pass_rate to sample
+        sample["pass_rate"] = pass_rate
+
+        # Categorize
+        if pass_rate == 1.0:
+            full_pass.append(sample)
+        elif pass_rate == 0.0:
+            no_pass.append(sample)
+        else:
+            partial_pass.append(sample)
+
+    # Sort partial pass by pass_rate (lowest first)
+    partial_pass.sort(key=lambda x: x["pass_rate"])
+
+    # Write files
+    files_written = []
+
+    # Write full pass file
+    if full_pass:
+        full_pass_file = output_path / "pass_rate_1.0.jsonl"
+        with open(full_pass_file, 'w') as f:
+            for sample in full_pass:
+                f.write(json.dumps(sample) + '\n')
+        logger.info(f"Written {len(full_pass)} samples to {full_pass_file}")
+        files_written.append(full_pass_file)
+
+    # Write no pass file
+    if no_pass:
+        no_pass_file = output_path / "pass_rate_0.0.jsonl"
+        with open(no_pass_file, 'w') as f:
+            for sample in no_pass:
+                f.write(json.dumps(sample) + '\n')
+        logger.info(f"Written {len(no_pass)} samples to {no_pass_file}")
+        files_written.append(no_pass_file)
+
+    # Write partial pass file (sorted by pass_rate)
+    if partial_pass:
+        partial_pass_file = output_path / "pass_rate_partial.jsonl"
+        with open(partial_pass_file, 'w') as f:
+            for sample in partial_pass:
+                f.write(json.dumps(sample) + '\n')
+        logger.info(f"Written {len(partial_pass)} samples to {partial_pass_file} (sorted by pass_rate, lowest first)")
+        files_written.append(partial_pass_file)
+
+    logger.info(f"\nPass rate files written:")
+    logger.info(f"  Pass rate 1.0: {len(full_pass)} samples")
+    logger.info(f"  Pass rate 0.0: {len(no_pass)} samples")
+    logger.info(f"  Pass rate partial: {len(partial_pass)} samples")
+    logger.info(f"  Total: {len(full_pass) + len(no_pass) + len(partial_pass)} samples")
 
 
 def main():
@@ -551,7 +655,7 @@ def main():
     parser.add_argument(
         "--model-path",
         type=str,
-        default="/root/data/hf_models/Qwen3-1.7B/",
+        default="/root/data/hf_models/Qwen3-0.6B/",
         help="Path to the HuggingFace model (ignored in vLLM mode)",
     )
     parser.add_argument(
@@ -569,7 +673,7 @@ def main():
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=16384,
+        default=8192,
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
@@ -620,6 +724,17 @@ def main():
         default=20,
         help="Number of parallel workers for vLLM mode (default: 20)",
     )
+    parser.add_argument(
+        "--attempts",
+        type=int,
+        default=1,
+        help="Number of times to run evaluation on the entire dataset (default: 1)",
+    )
+    parser.add_argument(
+        "--add-prompt-wrapper",
+        action="store_true",
+        help="Add prefix and suffix to prompts (default: False)",
+    )
 
     args = parser.parse_args()
 
@@ -636,6 +751,8 @@ def main():
         logger.info(f"Device: {args.device}")
     logger.info(f"Dataset path: {args.dataset_path}")
     logger.info(f"Number of samples: {args.num_samples if args.num_samples else 'all'}")
+    logger.info(f"Number of attempts: {args.attempts}")
+    logger.info(f"Add prompt wrapper: {args.add_prompt_wrapper}")
     logger.info(f"Max new tokens: {args.max_new_tokens}")
     logger.info(f"Temperature: {args.temperature}")
     logger.info(f"Sampling mode: {'greedy' if args.greedy else 'sampling'}")
@@ -654,6 +771,8 @@ def main():
         vllm_port=args.port,
         vllm_model_name=args.model_name,
         vllm_workers=args.workers,
+        attempts=args.attempts,
+        add_wrapper=args.add_prompt_wrapper,
     )
 
     # Print summary
@@ -661,15 +780,30 @@ def main():
     print("EVALUATION SUMMARY")
     print("="*50)
     for key, value in eval_results["summary"].items():
-        if key == "accuracy":
-            print(f"{key:20s}: {value:.2f}%")
-        elif key in ["avg_input_tokens", "avg_output_tokens"]:
-            print(f"{key:20s}: {value:.1f}")
+        if key in ["pass_at_k_percentage", "overall_accuracy_percentage"]:
+            print(f"{key:25s}: {value:.2f}%")
+        elif key in ["avg_input_tokens", "avg_output_tokens", "avg_at_k"]:
+            print(f"{key:25s}: {value:.2f}")
         elif key in ["total_input_tokens", "total_output_tokens"]:
-            print(f"{key:20s}: {value}")
+            print(f"{key:25s}: {value}")
         else:
-            print(f"{key:20s}: {value}")
+            print(f"{key:25s}: {value}")
     print("="*50 + "\n")
+
+    # Write pass rate files if multiple attempts were used
+    if args.attempts > 1:
+        # Determine output directory for pass rate files
+        if args.output:
+            pass_rate_dir = str(Path(args.output).parent)
+        else:
+            pass_rate_dir = "."
+
+        write_pass_rate_files(
+            samples=eval_results["samples"],
+            per_sample_results=eval_results["per_sample_results"],
+            attempts=args.attempts,
+            output_dir=pass_rate_dir,
+        )
 
     # Save detailed results if requested
     if args.output:
