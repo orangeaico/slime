@@ -206,13 +206,13 @@ def get_grpo_returns(
 ):
 
     returns = []
-    logger.info(f"[DEBUG get_grpo_returns] Rewards input: {rewards}")
+    # logger.info(f"[DEBUG get_grpo_returns] Rewards input: {rewards}")
     logger.info(f"[DEBUG get_grpo_returns] Rewards dtype: {rewards.dtype}, shape: {rewards.shape}")
     logger.info(f"[DEBUG get_grpo_returns] KL list length: {len(kl)}")
 
     for i in range(len(rewards)):
         ret = torch.ones_like(kl[i]) * rewards[i]
-        logger.info(f"[DEBUG get_grpo_returns] Sample {i}: reward={rewards[i]}, return shape={ret.shape}, return sample values (first 5)={ret[:5]}")
+        # logger.info(f"[DEBUG get_grpo_returns] Sample {i}: reward={rewards[i]}, return shape={ret.shape}, return sample values (first 5)={ret[:5]}")
         returns.append(ret)
 
     logger.info(f"[DEBUG get_grpo_returns] Final returns list length: {len(returns)}")

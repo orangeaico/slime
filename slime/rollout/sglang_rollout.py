@@ -382,10 +382,13 @@ async def generate_rollout_async(
     all_data = []
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
+    samples_count = 0
     while len(data) < target_data_size:
         while state.remaining_batch_size < target_data_size:
             # get samples from the buffer and submit the generation requests.
             samples = data_source(args.over_sampling_batch_size)
+            samples_count += len(samples)
+            logger.info(f"Total samples submitted for rollout till now: {samples_count}")
             state.submit_generate_tasks(samples)
 
         # wait for the generation to finish
@@ -401,9 +404,7 @@ async def generate_rollout_async(
                     reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"Reward value: {sample.reward['score']}"
                     if isinstance(sample.reward, dict) and 'meta_info' in sample.reward:
                         reward_summary += ", prompt_tokens: {sample.reward['meta_info']['prompt_tokens']}, completion_tokens: {sample.reward['meta_info']['completion_tokens']}, Input Token Logprobs: {sample.reward['meta_info']['input_token_logprobs'][:10]}, Output Token Logprobs: {sample.reward['meta_info']['output_token_logprobs'][:10]}"
-                    logger.info(
-                        f"First rollout sample: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
-                    )
+                    # logger.info(f"First rollout sample: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}")
                     do_print = False
 
             assert len(group) == args.n_samples_per_prompt
@@ -425,13 +426,11 @@ async def generate_rollout_async(
         for j, group_sample in enumerate(group):                
             sample = group_sample[0] if isinstance(group_sample, list) else group_sample
             # Safely format reward for logging (avoid huge dicts with teacher logprobs)
-            print (f"Group [{i}], Sample [{j}]: Finish rollout sample reward: {sample.reward}")
+            # print (f"Group [{i}], Sample [{j}]: Finish rollout sample reward: {sample.reward}")
             reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"Reward value: {sample.reward['score']}"
             if isinstance(sample.reward, dict) and 'meta_info' in sample.reward:
                 reward_summary += ", prompt_tokens: {sample.reward['meta_info']['prompt_tokens']}, completion_tokens: {sample.reward['meta_info']['completion_tokens']}, Input Token Logprobs: {sample.reward['meta_info']['input_token_logprobs'][:10]}, Output Token Logprobs: {sample.reward['meta_info']['output_token_logprobs'][:10]}"    
-            logger.info(
-                f"Finish rollout: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}",
-            )
+            # logger.info(f"Finish rollout: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}")
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)

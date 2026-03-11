@@ -450,7 +450,7 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     if args.advantage_estimator in ["grpo", "gspo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        logger.info(f"[DEBUG compute_advantages] GRPO rewards tensor: {rewards}")
+        # logger.info(f"[DEBUG compute_advantages] GRPO rewards tensor: {rewards}")
         logger.info(f"[DEBUG compute_advantages] GRPO rewards stats: min={rewards.min()}, max={rewards.max()}, mean={rewards.mean()}")
 
         returns = get_grpo_returns(rewards, kl)

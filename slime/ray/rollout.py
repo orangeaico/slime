@@ -504,7 +504,7 @@ class RolloutManager:
         ):
             # group norm
             rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            logger.info(f"[DEBUG] Rewards tensor before reshape: {rewards}")
+            # logger.info(f"[DEBUG] Rewards tensor before reshape: {rewards}")
 
             if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
                 rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
@@ -512,24 +512,24 @@ class RolloutManager:
                 # when samples count are not equal in each group
                 rewards = rewards.view(-1, rewards.shape[-1])
 
-            logger.info(f"[DEBUG] Rewards tensor after reshape: {rewards}")
+            # logger.info(f"[DEBUG] Rewards tensor after reshape: {rewards}")
 
             mean = rewards.mean(dim=-1, keepdim=True)
             logger.info(f"[DEBUG] Mean per group: {mean}")
 
             rewards = rewards - mean
-            logger.info(f"[DEBUG] Rewards after mean subtraction: {rewards}")
+            # logger.info(f"[DEBUG] Rewards after mean subtraction: {rewards}")
 
             if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
                 std = rewards.std(dim=-1, keepdim=True)
-                logger.info(f"[DEBUG] Std per group: {std}")
+                # logger.info(f"[DEBUG] Std per group: {std}")
                 rewards = rewards / (std + 1e-6)
                 logger.info(f"[DEBUG] Rewards after std division: {rewards}")
             else:
                 logger.info(f"[DEBUG] Skipping std normalization (grpo_std_normalization={self.args.grpo_std_normalization})")
 
             normalized_rewards = rewards.flatten().tolist()
-            logger.info(f"[DEBUG] Final normalized rewards: {normalized_rewards}")
+            # logger.info(f"[DEBUG] Final normalized rewards: {normalized_rewards}")
             logger.info(f"[DEBUG] Sum of normalized rewards: {sum(normalized_rewards)}, Mean: {sum(normalized_rewards)/len(normalized_rewards)}")
             return raw_rewards, normalized_rewards
 
