@@ -3,10 +3,12 @@
 
 from argparse import Namespace
 
+import logging
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+logger = logging.getLogger(__name__)
 
 @torch.compile(dynamic=True)
 def compute_approx_kl(
@@ -202,9 +204,18 @@ def get_grpo_returns(
     rewards: torch.Tensor,
     kl: list[torch.Tensor],
 ):
+
     returns = []
+    logger.info(f"[DEBUG get_grpo_returns] Rewards input: {rewards}")
+    logger.info(f"[DEBUG get_grpo_returns] Rewards dtype: {rewards.dtype}, shape: {rewards.shape}")
+    logger.info(f"[DEBUG get_grpo_returns] KL list length: {len(kl)}")
+
     for i in range(len(rewards)):
-        returns.append(torch.ones_like(kl[i]) * rewards[i])
+        ret = torch.ones_like(kl[i]) * rewards[i]
+        logger.info(f"[DEBUG get_grpo_returns] Sample {i}: reward={rewards[i]}, return shape={ret.shape}, return sample values (first 5)={ret[:5]}")
+        returns.append(ret)
+
+    logger.info(f"[DEBUG get_grpo_returns] Final returns list length: {len(returns)}")
     return returns
 
 

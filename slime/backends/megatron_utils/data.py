@@ -403,6 +403,7 @@ def log_rollout_data(
     - Scalars are converted to Python numbers.
     """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
+        logger.info (f"[DEBUG] log_rollout_data: Rollout data reward: {rollout_data['rewards']}, Raw reward: {rollout_data['raw_reward']}")
         cp_size = mpu.get_context_parallel_world_size()
         log_dict = {}
         response_lengths = rollout_data["response_lengths"]
@@ -439,6 +440,11 @@ def log_rollout_data(
                         "opd_reverse_kl",
                     ]:
                         val = torch.cat(val).clone().detach()
+                        if key in ["advantages", "returns"]:
+                            logger.info(f"[DEBUG log_rollout_data] Key '{key}': concatenated tensor shape={val.shape}")
+                            logger.info(f"[DEBUG log_rollout_data] Key '{key}': tensor values (first 20)={val[:20]}")
+                            logger.info(f"[DEBUG log_rollout_data] Key '{key}': min={val.min()}, max={val.max()}, mean={val.mean()}")
+
                         sum_of_sample_mean = get_sum_of_sample_mean(
                             total_lengths,
                             response_lengths,
@@ -447,6 +453,10 @@ def log_rollout_data(
                             max_seq_lens=max_seq_lens,
                         )
                         val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
+
+                        if key in ["advantages", "returns"]:
+                            logger.info(f"[DEBUG log_rollout_data] Key '{key}': final value after averaging={val}")
+                            logger.info(f"[DEBUG log_rollout_data] Key '{key}': cp_size={cp_size}, num_samples={len(loss_masks)}")
                     else:
                         val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
@@ -458,7 +468,10 @@ def log_rollout_data(
                 raise ValueError(f"Unsupported type: {type(val)} for key: {key}")
             log_dict[key] = val.item() if isinstance(val, torch.Tensor) else val
 
+        logger.info(f"[DEBUG log_rollout_data] Before reducing {log_dict}")
         reduced_log_dict = gather_log_data("rollout", args, rollout_id, log_dict)
+
+        logger.info(f"[DEBUG log_rollout_data] After reducing {reduced_log_dict}")
         if args.ci_test and reduced_log_dict is not None:
             if (
                 rollout_id == 0
@@ -533,6 +546,7 @@ def log_rollout_data(
                 rollout_data["correct_entropy"] = [correct_entropy.item()] * num_correct_responses
             else:
                 rollout_data["correct_entropy"] = [0] * num_correct_responses
+    logger.info (f"[DEBUG] log_rollout_data end: Rollout data reward: {rollout_data['rewards']}, Raw reward: {rollout_data['raw_reward']}")
 
 
 def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -> None:

@@ -189,6 +189,10 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_rank(with_context_parallel=False),
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
+
+        logger.info (f"[DEBUG] Rollout data keys: {rollout_data.keys()}")
+        logger.info (f"[DEBUG] Rollout data reward: {rollout_data['rewards']}, Raw reward: {rollout_data['raw_reward']}")
+
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         rollout_data["tokens"] = [

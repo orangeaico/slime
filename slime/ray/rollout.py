@@ -495,26 +495,45 @@ class RolloutManager:
             return self.custom_reward_post_process_func(self.args, samples)
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+        logger.info(f"[DEBUG] Raw rewards (extracted from samples): {raw_rewards}")
+        logger.info(f"[DEBUG] Raw rewards stats: min={min(raw_rewards)}, max={max(raw_rewards)}, mean={sum(raw_rewards)/len(raw_rewards)}")
+
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
             # group norm
             rewards = torch.tensor(raw_rewards, dtype=torch.float)
+            logger.info(f"[DEBUG] Rewards tensor before reshape: {rewards}")
+
             if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
                 rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
             else:
                 # when samples count are not equal in each group
                 rewards = rewards.view(-1, rewards.shape[-1])
+
+            logger.info(f"[DEBUG] Rewards tensor after reshape: {rewards}")
+
             mean = rewards.mean(dim=-1, keepdim=True)
+            logger.info(f"[DEBUG] Mean per group: {mean}")
+
             rewards = rewards - mean
+            logger.info(f"[DEBUG] Rewards after mean subtraction: {rewards}")
 
             if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
                 std = rewards.std(dim=-1, keepdim=True)
+                logger.info(f"[DEBUG] Std per group: {std}")
                 rewards = rewards / (std + 1e-6)
+                logger.info(f"[DEBUG] Rewards after std division: {rewards}")
+            else:
+                logger.info(f"[DEBUG] Skipping std normalization (grpo_std_normalization={self.args.grpo_std_normalization})")
 
-            return raw_rewards, rewards.flatten().tolist()
+            normalized_rewards = rewards.flatten().tolist()
+            logger.info(f"[DEBUG] Final normalized rewards: {normalized_rewards}")
+            logger.info(f"[DEBUG] Sum of normalized rewards: {sum(normalized_rewards)}, Mean: {sum(normalized_rewards)/len(normalized_rewards)}")
+            return raw_rewards, normalized_rewards
 
+        logger.info(f"[DEBUG] Skipping reward normalization (rewards_normalization={self.args.rewards_normalization})")
         return raw_rewards, raw_rewards
 
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):

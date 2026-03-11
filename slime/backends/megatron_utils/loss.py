@@ -1,3 +1,4 @@
+import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
 from typing import Any
@@ -7,6 +8,8 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from megatron.core import mpu
 from torch.utils.checkpoint import checkpoint
+
+logger = logging.getLogger(__name__)
 
 from slime.utils.distributed_utils import distributed_masked_whiten
 from slime.utils.misc import load_function
@@ -447,9 +450,17 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
 
     if args.advantage_estimator in ["grpo", "gspo"]:
         rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
+        logger.info(f"[DEBUG compute_advantages] GRPO rewards tensor: {rewards}")
+        logger.info(f"[DEBUG compute_advantages] GRPO rewards stats: min={rewards.min()}, max={rewards.max()}, mean={rewards.mean()}")
+
         returns = get_grpo_returns(rewards, kl)
+        logger.info(f"[DEBUG compute_advantages] After get_grpo_returns: len={len(returns)}")
+        logger.info(f"[DEBUG compute_advantages] Returns sample 0: shape={returns[0].shape}, values (first 5)={returns[0][:5]}")
+
         # TODO: is the copy necessary?
         advantages = [r for r in returns]
+        logger.info(f"[DEBUG compute_advantages] After copying returns to advantages: len={len(advantages)}")
+        logger.info(f"[DEBUG compute_advantages] Advantages sample 0: shape={advantages[0].shape}, values (first 5)={advantages[0][:5]}")
 
     elif args.advantage_estimator == "ppo":
         old_rewards = rewards
