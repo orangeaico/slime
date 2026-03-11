@@ -28,6 +28,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "/root/slime/scripts/models/qwen3-0.6B.sh"
 
+
    
 CKPT_ARGS=(
    --hf-checkpoint /root/data/hf_models/Qwen3-0.6B
@@ -35,14 +36,14 @@ CKPT_ARGS=(
    # --load /root/data/mega-models/Qwen3-0.6B_slime/
    # --no-load-rng
    # --no-load-optim
-   --save /root/data/mega-models/Qwen3-0.6B_rl/
+   --save /root/data/mega-models/Qwen3-0.6B_rl_grpo/
    --no-save-optim
    --no-save-rng
-   --save-interval 50
+   --save-interval 95
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/data/datasets/gsm8k/train.jsonl
+   --prompt-data /root/data/datasets/gsm8k/train_pass_partial_less_50.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -51,13 +52,13 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
 
-   --num-rollout 300
-   --rollout-batch-size 4
+   --num-rollout 600
+   --rollout-batch-size 8
    --n-samples-per-prompt 8
-   --rollout-max-response-len 8192
+   --rollout-max-response-len 4096
    --rollout-temperature 1
 
-   --global-batch-size 32
+   --global-batch-size 64
    --balance-data
 )
 
@@ -86,7 +87,7 @@ PERF_ARGS=(
 
    --micro-batch-size 1
    # --use-dynamic-batch-size
-   --max-tokens-per-gpu 8192
+   --max-tokens-per-gpu 4096
 )
 
 GRPO_ARGS=(
@@ -97,6 +98,8 @@ GRPO_ARGS=(
    --entropy-coef 0.00
    --eps-clip 0.2
    --eps-clip-high 0.28
+   # --disable-rewards-normalization
+   # --disable-grpo-std-normalization
 )
 
 OPTIMIZER_ARGS=(
@@ -109,9 +112,9 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   #--use-wandb
-   # --wandb-project slime-dev
-   # --wandb-group qwen3-8B-test
+   # --use-wandb
+   # --wandb-project slime-rl
+   # --wandb-group qwen3-06B-gsm
    # --wandb-key ${WANDB_KEY}
 )
 
