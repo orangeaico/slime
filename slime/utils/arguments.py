@@ -768,7 +768,36 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
 
             parser.add_argument("--eps-clip", type=float, default=0.2, help="PPO clip range")
-            parser.add_argument("--eps-clip-high", type=float, default=None, help="PPO clip upper range")
+            parser.add_argument(
+                "--eps-clip-high",
+                type=float,
+                default=None,
+                help="PPO clip upper range. In CISPO mode, this is the upper cap on detached importance weights.",
+            )
+            parser.add_argument(
+                "--dispo-pos-eps-clip-low",
+                type=float,
+                default=None,
+                help="DISPO low-side clip width for positive-advantage tokens (the paper's correct regime).",
+            )
+            parser.add_argument(
+                "--dispo-pos-eps-clip-high",
+                type=float,
+                default=None,
+                help="DISPO high-side clip width for positive-advantage tokens (the paper's correct regime).",
+            )
+            parser.add_argument(
+                "--dispo-neg-eps-clip-low",
+                type=float,
+                default=None,
+                help="DISPO low-side clip width for negative-advantage tokens (the paper's incorrect regime).",
+            )
+            parser.add_argument(
+                "--dispo-neg-eps-clip-high",
+                type=float,
+                default=None,
+                help="DISPO high-side clip width for negative-advantage tokens (the paper's incorrect regime).",
+            )
             parser.add_argument(
                 "--eps-clip-c",
                 type=float,
@@ -785,11 +814,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--loss-type",
                 type=str,
-                choices=["policy_loss", "sft_loss", "custom_loss"],
+                choices=["policy_loss", "sft_loss", "custom_loss", "cispo_loss", "dispo_loss"],
                 default="policy_loss",
                 help=(
-                    "Choose loss type, currently support ppo policy_loss or sft_loss, "
-                    "if custom_loss is set, we will use the function path from `--custom-loss-function-path`."
+                    "Choose loss type. `policy_loss` uses the default PPO/GSPO-style objective, "
+                    "`cispo_loss` uses the detached upper-clipped importance-weight objective, and "
+                    "`dispo_loss` uses sign-decoupled clipped importance weights with token-level normalization. "
+                    "`custom_loss` uses the function path from `--custom-loss-function-path`."
                 ),
             )
             parser.add_argument(
@@ -1543,6 +1574,11 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+    if args.loss_type == "cispo_loss" and args.train_backend == "fsdp":
+        raise ValueError("CISPO is currently supported only on the Megatron backend. Please remove --train-backend fsdp.")
+    if args.loss_type == "dispo_loss" and args.train_backend == "fsdp":
+        raise ValueError("DISPO is currently supported only on the Megatron backend. Please remove --train-backend fsdp.")
+
     args.eval_datasets = _resolve_eval_datasets(args)
 
     if args.kl_coef != 0 or args.use_kl_loss:
@@ -1646,7 +1682,26 @@ def slime_validate_args(args):
         if args.log_probs_max_tokens_per_gpu is None:
             args.log_probs_max_tokens_per_gpu = args.max_tokens_per_gpu
 
-    if args.eps_clip_high is None:
+    if args.loss_type == "dispo_loss":
+        dispo_clip_args = [
+            "dispo_pos_eps_clip_low",
+            "dispo_pos_eps_clip_high",
+            "dispo_neg_eps_clip_low",
+            "dispo_neg_eps_clip_high",
+        ]
+        missing_dispo_clip_args = [name for name in dispo_clip_args if getattr(args, name) is None]
+        if missing_dispo_clip_args:
+            raise ValueError(
+                "DISPO requires all four clip args: "
+                "--dispo-pos-eps-clip-low, --dispo-pos-eps-clip-high, "
+                "--dispo-neg-eps-clip-low, --dispo-neg-eps-clip-high."
+            )
+        args.calculate_per_token_loss = True
+
+    if args.loss_type == "cispo_loss":
+        if args.eps_clip_high is None:
+            args.eps_clip_high = 5.0
+    elif args.eps_clip_high is None:
         args.eps_clip_high = args.eps_clip
 
     if args.eval_reward_key is None:

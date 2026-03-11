@@ -16,6 +16,8 @@ from slime.utils.misc import load_function
 from slime.utils.ppo_utils import (
     calculate_log_probs_and_entropy,
     compute_approx_kl,
+    compute_cispo_loss,
+    compute_dispo_loss,
     compute_gspo_kl,
     compute_opsm_mask,
     compute_policy_loss,
@@ -627,13 +629,13 @@ def policy_loss_function(
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Compute policy loss (PPO/GSPO) and metrics.
+    """Compute policy loss (PPO/GSPO/CISPO/DISPO) and metrics.
 
     Computes current log-probabilities and entropy from model logits, then
-    calculates PPO-style clipped policy gradient loss. For GSPO, gathers
-    full sequences via context-parallel all-gather before computing per-sample
-    KL. Optionally applies TIS (Truncated Importance Sampling) correction and
-    adds KL loss term if configured.
+    calculates the configured policy-gradient objective. For GSPO, gathers full
+    sequences via context-parallel all-gather before computing per-sample KL.
+    Optionally applies TIS (Truncated Importance Sampling) correction and adds
+    KL loss term if configured.
 
     Args:
         args: Configuration controlling advantage estimator, clipping thresholds,
@@ -669,9 +671,11 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    log_probs_list = log_probs
+    old_log_probs_list = old_log_probs
 
-    # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering
-    need_full_log_probs = args.use_opsm or args.advantage_estimator == "gspo"
+    # Pre-gather log probs if needed by OPSM or GSPO to avoid duplicate gathering.
+    need_full_log_probs = args.use_opsm or (args.loss_type == "policy_loss" and args.advantage_estimator == "gspo")
 
     full_log_probs = None
     full_old_log_probs = None
@@ -679,13 +683,13 @@ def policy_loss_function(
         full_log_probs = [
             all_gather_with_cp(log_prob, total_length, response_length)
             for log_prob, total_length, response_length in zip(
-                log_probs, total_lengths, response_lengths, strict=False
+                log_probs_list, total_lengths, response_lengths, strict=False
             )
         ]
         full_old_log_probs = [
             all_gather_with_cp(old_log_prob, total_length, response_length)
             for old_log_prob, total_length, response_length in zip(
-                old_log_probs, total_lengths, response_lengths, strict=False
+                old_log_probs_list, total_lengths, response_lengths, strict=False
             )
         ]
 
@@ -699,22 +703,40 @@ def policy_loss_function(
             loss_masks=batch["loss_masks"],
         )
 
-    # Compute KL divergence (GSPO uses sequence-level KL, others use per-token KL)
-    if args.advantage_estimator == "gspo":
-        ppo_kl = compute_gspo_kl(
+    old_log_probs = torch.cat(old_log_probs_list, dim=0)
+    log_probs = torch.cat(log_probs_list, dim=0)
+    per_token_ppo_kl = old_log_probs - log_probs
+
+    # GSPO keeps its sequence-level KL only for the default PPO-style loss.
+    if args.loss_type == "policy_loss" and args.advantage_estimator == "gspo":
+        policy_ppo_kl = compute_gspo_kl(
             full_log_probs=full_log_probs,
             full_old_log_probs=full_old_log_probs,
-            local_log_probs=log_probs,
+            local_log_probs=log_probs_list,
             loss_masks=batch["loss_masks"],
         )
-        old_log_probs = torch.cat(old_log_probs, dim=0)
-        log_probs = torch.cat(log_probs, dim=0)
+        reported_ppo_kl = policy_ppo_kl
     else:
-        old_log_probs = torch.cat(old_log_probs, dim=0)
-        log_probs = torch.cat(log_probs, dim=0)
-        ppo_kl = old_log_probs - log_probs
+        policy_ppo_kl = per_token_ppo_kl
+        reported_ppo_kl = per_token_ppo_kl
 
-    pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+    if args.loss_type == "cispo_loss":
+        pg_loss, pg_clipfrac = compute_cispo_loss(log_probs, old_log_probs, advantages, args.eps_clip_high)
+        reported_ppo_kl = per_token_ppo_kl.abs()
+    elif args.loss_type == "dispo_loss":
+        pg_loss, pg_clipfrac = compute_dispo_loss(
+            log_probs,
+            old_log_probs,
+            advantages,
+            args.dispo_pos_eps_clip_low,
+            args.dispo_pos_eps_clip_high,
+            args.dispo_neg_eps_clip_low,
+            args.dispo_neg_eps_clip_high,
+        )
+        reported_ppo_kl = per_token_ppo_kl.abs()
+    else:
+        pg_loss, pg_clipfrac = compute_policy_loss(policy_ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -733,7 +755,7 @@ def policy_loss_function(
 
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
-        ois = (-ppo_kl).exp()
+        ois = (-policy_ppo_kl).exp()
         tis_kwargs = {
             "args": args,
             "pg_loss": pg_loss,
@@ -774,7 +796,7 @@ def policy_loss_function(
 
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
-    ppo_kl = sum_of_sample_mean(ppo_kl)
+    ppo_kl = sum_of_sample_mean(reported_ppo_kl)
 
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
@@ -994,6 +1016,10 @@ def loss_function(
 
     match args.loss_type:
         case "policy_loss":
+            func = policy_loss_function
+        case "cispo_loss":
+            func = policy_loss_function
+        case "dispo_loss":
             func = policy_loss_function
         case "value_loss":
             func = value_loss_function

@@ -10,6 +10,7 @@ import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
 
+
 @torch.compile(dynamic=True)
 def compute_approx_kl(
     log_probs: torch.Tensor,
@@ -121,6 +122,48 @@ def compute_gspo_kl(
     ppo_kl = torch.cat(ppo_kl, dim=0)
 
     return ppo_kl
+
+
+@torch.compile(dynamic=True)
+def compute_cispo_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    epsilon_high: float,
+):
+    ratio = (log_probs - old_log_probs).exp()
+    clamped_ratio = ratio.clamp(max=epsilon_high).detach()
+    pg_losses = -clamped_ratio * advantages * log_probs
+    clipfrac = torch.gt(ratio, epsilon_high).float()
+    return pg_losses, clipfrac
+
+
+@torch.compile(dynamic=True)
+def compute_dispo_loss(
+    log_probs: torch.Tensor,
+    old_log_probs: torch.Tensor,
+    advantages: torch.Tensor,
+    pos_eps_clip_low: float,
+    pos_eps_clip_high: float,
+    neg_eps_clip_low: float,
+    neg_eps_clip_high: float,
+):
+    ratio = (log_probs - old_log_probs).exp()
+    is_positive_advantage = advantages >= 0
+    low = torch.where(
+        is_positive_advantage,
+        torch.full_like(ratio, 1 - pos_eps_clip_low),
+        torch.full_like(ratio, 1 - neg_eps_clip_low),
+    )
+    high = torch.where(
+        is_positive_advantage,
+        torch.full_like(ratio, 1 + pos_eps_clip_high),
+        torch.full_like(ratio, 1 + neg_eps_clip_high),
+    )
+    clamped_ratio = ratio.clamp(min=low, max=high).detach()
+    pg_losses = -clamped_ratio * advantages * log_probs
+    clipfrac = torch.logical_or(ratio < low, ratio > high).float()
+    return pg_losses, clipfrac
 
 
 @torch.compile(dynamic=True)

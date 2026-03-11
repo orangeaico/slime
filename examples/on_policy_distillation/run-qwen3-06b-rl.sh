@@ -28,6 +28,37 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "/root/slime/scripts/models/qwen3-0.6B.sh"
 
+LOSS_TYPE=${LOSS_TYPE:-cispo_loss}
+CISPO_EPS_CLIP_HIGH=${CISPO_EPS_CLIP_HIGH:-5.0}
+DISPO_POS_EPS_CLIP_LOW=${DISPO_POS_EPS_CLIP_LOW:-0.2}
+DISPO_POS_EPS_CLIP_HIGH=${DISPO_POS_EPS_CLIP_HIGH:-10}
+DISPO_NEG_EPS_CLIP_LOW=${DISPO_NEG_EPS_CLIP_LOW:-1.0}
+DISPO_NEG_EPS_CLIP_HIGH=${DISPO_NEG_EPS_CLIP_HIGH:-100}
+
+LOSS_ARGS=(
+   --loss-type ${LOSS_TYPE}
+)
+
+LOSS_SPECIFIC_ARGS=()
+if [ "${LOSS_TYPE}" = "cispo_loss" ]; then
+   LOSS_SPECIFIC_ARGS=(
+      --eps-clip-high ${CISPO_EPS_CLIP_HIGH}
+      --calculate-per-token-loss
+   )
+elif [ "${LOSS_TYPE}" = "dispo_loss" ]; then
+   LOSS_SPECIFIC_ARGS=(
+      --dispo-pos-eps-clip-low ${DISPO_POS_EPS_CLIP_LOW}
+      --dispo-pos-eps-clip-high ${DISPO_POS_EPS_CLIP_HIGH}
+      --dispo-neg-eps-clip-low ${DISPO_NEG_EPS_CLIP_LOW}
+      --dispo-neg-eps-clip-high ${DISPO_NEG_EPS_CLIP_HIGH}
+      --calculate-per-token-loss
+   )
+else
+   LOSS_SPECIFIC_ARGS=(
+      --eps-clip-high 0.28
+   )
+fi
+
 
    
 CKPT_ARGS=(
@@ -92,12 +123,13 @@ PERF_ARGS=(
 
 GRPO_ARGS=(
    --advantage-estimator grpo
+   ${LOSS_ARGS[@]}
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
    --entropy-coef 0.00
    --eps-clip 0.2
-   --eps-clip-high 0.28
+   ${LOSS_SPECIFIC_ARGS[@]}
    # --disable-rewards-normalization
    # --disable-grpo-std-normalization
 )
