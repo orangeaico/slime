@@ -28,7 +28,7 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "/root/slime/scripts/models/qwen3-0.6B.sh"
 
-LOSS_TYPE=${LOSS_TYPE:-cispo_loss}
+LOSS_TYPE=${LOSS_TYPE:-policy_loss}
 CISPO_EPS_CLIP_HIGH=${CISPO_EPS_CLIP_HIGH:-5.0}
 DISPO_POS_EPS_CLIP_LOW=${DISPO_POS_EPS_CLIP_LOW:-0.2}
 DISPO_POS_EPS_CLIP_HIGH=${DISPO_POS_EPS_CLIP_HIGH:-10}
@@ -67,10 +67,10 @@ CKPT_ARGS=(
    # --load /root/data/mega-models/Qwen3-0.6B_slime/
    # --no-load-rng
    # --no-load-optim
-   --save /root/data/mega-models/Qwen3-0.6B_rl_grpo/
+   --save /root/data/mega-models/Qwen3-0.6B_rl_grpo_1533/
    --no-save-optim
    --no-save-rng
-   --save-interval 95
+   --save-interval 48
 )
 
 ROLLOUT_ARGS=(
@@ -78,30 +78,42 @@ ROLLOUT_ARGS=(
    --input-key prompt
    --label-key label
    --apply-chat-template
+   --apply-chat-template-kwargs '{"enable_thinking":false}'
    --rollout-shuffle
 
    --rm-type dapo
    --reward-key score
 
-   --num-rollout 600
-   --rollout-batch-size 8
+   --num-rollout 192
+   --rollout-batch-size 32
+   # --over-sampling-batch-size 40
    --n-samples-per-prompt 8
    --rollout-max-response-len 4096
-   --rollout-temperature 1
 
-   --global-batch-size 64
+   --rollout-temperature 0.7
+   --rollout-top-p 0.8
+   --rollout-top-k 20
+   --use-rollout-logprobs
+
+   --global-batch-size 256
    --balance-data
 )
 
 RM_ARGS=(
 )
 
-EVAL_ARGS=(
-   # --eval-interval 20
-   # --eval-prompt-data aime ${DATA_DIR}/aime-2024/aime-2024.jsonl
-   # --n-samples-per-eval-prompt 16
-   # --eval-max-response-len 16384
-   # --eval-top-p 1
+EVAL_ARGS=(   
+   --eval-interval 24
+   --eval-prompt-data gsm8k /root/data/datasets/gsm8k/test_100.jsonl
+   --n-samples-per-eval-prompt 4   
+
+   --eval-input-key prompt
+   --eval-label-key label
+
+   --eval-max-response-len 4096
+   --eval-temperature 0.7
+   --eval-top-p 0.8
+   --eval-top-k 20
 )
 
 PERF_ARGS=(
