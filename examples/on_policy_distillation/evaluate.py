@@ -222,7 +222,7 @@ def generate_response_vllm(
     # Prepare API request
     url = f"http://localhost:{port}/v1/chat/completions"
 
-    # # Non-thinking payload for qwen3 1.7B
+    # Non-thinking payload for qwen3 0.6B
     payload = {
         "model": model_name,
         "messages": messages,
@@ -236,6 +236,7 @@ def generate_response_vllm(
         }
     }
 
+    # # Thinking payload for qwen3 0.6B
     # payload = {
     #     "model": model_name,
     #     "messages": messages,
@@ -673,7 +674,7 @@ def main():
     parser.add_argument(
         "--max-new-tokens",
         type=int,
-        default=8192,
+        default=4096,
         help="Maximum number of tokens to generate",
     )
     parser.add_argument(
