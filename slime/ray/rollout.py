@@ -885,7 +885,9 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     log_dict = extra_metrics or {}
     for key in data.keys():
         rewards = data[key]["rewards"]
+        # print (f"[EVAL DEBUG] Rewards {rewards}")
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)
+        log_dict[f"eval/{key}_avg@k_accuracy"] = rewards.count(1) / len(rewards)
         if (samples := data[key].get("samples")) is not None:
             log_dict |= dict_add_prefix(compute_metrics_from_samples(args, samples), f"eval/{key}/")
         if "truncated" in data[key]:
