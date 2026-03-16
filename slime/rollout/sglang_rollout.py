@@ -383,13 +383,20 @@ async def generate_rollout_async(
     do_print = True
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     samples_count = 0
+    first_sampling = True
+    ADDITIONAL_SAMPLING_STEP_SIZE = 32
     while len(data) < target_data_size:
+        # logger.info (f"state.remaining_batch_size - {state.remaining_batch_size}")
         while state.remaining_batch_size < target_data_size:
-            # get samples from the buffer and submit the generation requests.
-            samples = data_source(args.over_sampling_batch_size)
+            # get samples from the buffer and submit the generation requests. 
+            if first_sampling:           
+                samples = data_source(args.over_sampling_batch_size)
+            else:
+                samples = data_source(ADDITIONAL_SAMPLING_STEP_SIZE)
             samples_count += len(samples)
-            logger.info(f"Total samples submitted for rollout till now: {samples_count}")
+            logger.info(f"Total samples submitted for rollout till now: {samples_count}, current samples: {len(samples)}")
             state.submit_generate_tasks(samples)
+            first_sampling = False
 
         # wait for the generation to finish
         done, state.pendings = await asyncio.wait(state.pendings, return_when=asyncio.FIRST_COMPLETED)
@@ -411,6 +418,7 @@ async def generate_rollout_async(
             all_data.append(group)
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
+                logger.info(f"Dropping group {group[0][0].index if isinstance(group[0], list) else group[0].index} due to {dynamic_filter_output.reason}")
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 state.remaining_batch_size -= 1
                 continue
@@ -421,6 +429,7 @@ async def generate_rollout_async(
                 data.append(group)
                 pbar.update(args.n_samples_per_prompt)
 
+    logger.info(f"Len of data after rollout loop end: {len(data)}")
     pbar.close()
     for i, group in enumerate(data):
         for j, group_sample in enumerate(group):                
