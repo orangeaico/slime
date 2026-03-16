@@ -28,6 +28,8 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "/root/slime/scripts/models/qwen3-0.6B.sh"
 
+MAX_SEQ_LEN=1024
+
 LOSS_TYPE=${LOSS_TYPE:-policy_loss}
 CISPO_EPS_CLIP_HIGH=${CISPO_EPS_CLIP_HIGH:-5.0}
 DISPO_POS_EPS_CLIP_LOW=${DISPO_POS_EPS_CLIP_LOW:-0.2}
@@ -62,19 +64,19 @@ fi
 
    
 CKPT_ARGS=(
-   --hf-checkpoint /root/data/hf_models/Qwen3-0.6B
-   --ref-load /root/data/mega-models/Qwen3-0.6B
+   --hf-checkpoint /root/data/hf_models/Qwen3-0.6B_rl_grpo_non_think_7473_4_steps
+   --ref-load /root/data/mega-models/Qwen3-0.6B_rl_grpo_non_think_7473_4_steps
    # --load /root/data/mega-models/Qwen3-0.6B_slime/
    # --no-load-rng
    # --no-load-optim
-   --save /root/data/mega-models/Qwen3-0.6B_rl_grpo_1533/
+   --save /root/data/mega-models/Qwen3-0.6B_rl_cispo_non_think_7473
    --no-save-optim
    --no-save-rng
-   --save-interval 48
+   --save-interval 117
 )
 
 ROLLOUT_ARGS=(
-   --prompt-data /root/data/datasets/gsm8k/train_pass_partial_less_50.jsonl
+   --prompt-data /root/data/datasets/gsm8k/train.jsonl
    --input-key prompt
    --label-key label
    --apply-chat-template
@@ -84,33 +86,35 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
 
-   --num-rollout 192
+   --num-rollout 936
    --rollout-batch-size 32
-   # --over-sampling-batch-size 40
+   --num-steps-per-rollout 4
+   --over-sampling-batch-size 48
    --n-samples-per-prompt 8
-   --rollout-max-response-len 4096
+   --rollout-max-response-len $MAX_SEQ_LEN
 
    --rollout-temperature 0.7
    --rollout-top-p 0.8
    --rollout-top-k 20
    --use-rollout-logprobs
 
-   --global-batch-size 256
+   --global-batch-size 64
    --balance-data
 )
 
 RM_ARGS=(
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 )
 
 EVAL_ARGS=(   
-   --eval-interval 24
+   --eval-interval 29
    --eval-prompt-data gsm8k /root/data/datasets/gsm8k/test_100.jsonl
    --n-samples-per-eval-prompt 4   
 
    --eval-input-key prompt
    --eval-label-key label
 
-   --eval-max-response-len 4096
+   --eval-max-response-len $MAX_SEQ_LEN
    --eval-temperature 0.7
    --eval-top-p 0.8
    --eval-top-k 20
@@ -128,9 +132,9 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --micro-batch-size 1
+   --micro-batch-size 4
    # --use-dynamic-batch-size
-   --max-tokens-per-gpu 4096
+   --max-tokens-per-gpu $MAX_SEQ_LEN
 )
 
 GRPO_ARGS=(
@@ -165,7 +169,7 @@ WANDB_ARGS=(
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.8
-   # --partial-rollout
+   --partial-rollout
 )
 
 
