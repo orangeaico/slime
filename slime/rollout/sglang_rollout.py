@@ -439,7 +439,7 @@ async def generate_rollout_async(
             reward_summary = sample.reward if not isinstance(sample.reward, dict) else f"Reward value: {sample.reward['score']}"
             if isinstance(sample.reward, dict) and 'meta_info' in sample.reward:
                 reward_summary += ", prompt_tokens: {sample.reward['meta_info']['prompt_tokens']}, completion_tokens: {sample.reward['meta_info']['completion_tokens']}, Input Token Logprobs: {sample.reward['meta_info']['input_token_logprobs'][:10]}, Output Token Logprobs: {sample.reward['meta_info']['output_token_logprobs'][:10]}"    
-            # logger.info(f"Finish rollout: {[str(sample.prompt[:100]) + '=========' + sample.response[:-100]]}, label: {str(sample.label)[:100]}, reward: {reward_summary}")
+            # logger.info(f"Finish rollout: {[str(sample.prompt[:100]) + '=========' + sample.response]}, label: {str(sample.label)}, reward: {reward_summary}")
 
     # there are still some unfinished requests, abort them
     aborted_samples = await abort(args, rollout_id)

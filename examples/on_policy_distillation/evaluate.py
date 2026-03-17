@@ -79,6 +79,18 @@ def add_prompt_wrapper(content: str) -> str:
     return content
 
 
+def get_prompt_text(prompt: Any) -> str:
+    """Extract plain prompt text for logging and output files."""
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+        for message in reversed(prompt):
+            if message.get("role") == "user":
+                return message.get("content", "")
+        return prompt[0].get("content", "")
+    return str(prompt)
+
+
 def normalize_answer(answer: str) -> str:
     """Normalize answer for comparison."""
     if answer is None:
@@ -307,6 +319,7 @@ def process_single_sample(
 ) -> dict[str, Any]:
     """Process a single sample and return the result."""
     prompt = sample["prompt"]
+    prompt_text = get_prompt_text(prompt)
     true_answer = sample["label"]
     logger.info(f"[Sample {idx}] True answer: {true_answer}")
 
@@ -343,7 +356,7 @@ def process_single_sample(
         # Store result
         result = {
             "idx": idx,
-            "prompt": prompt if isinstance(prompt, str) else prompt[0]["content"],
+            "prompt": prompt_text,
             "response": response,
             "predicted_answer": pred_answer,
             "true_answer": true_answer,
@@ -357,11 +370,46 @@ def process_single_sample(
         logger.error(f"[Sample {idx}] ERROR: {e}", exc_info=True)
         return {
             "idx": idx,
+            "prompt": prompt_text,
+            "response": None,
+            "predicted_answer": None,
+            "true_answer": true_answer,
             "error": str(e),
             "correct": False,
             "input_tokens": 0,
             "output_tokens": 0,
         }
+
+
+def write_attempt_results_file(
+    attempt_results: dict[int, dict[str, Any]],
+    attempt_num: int,
+    output_dir: str,
+) -> Path:
+    """Write one JSONL file for a single attempt."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    attempt_file = output_path / f"attempt_{attempt_num}.jsonl"
+    with open(attempt_file, "w") as f:
+        for idx in sorted(attempt_results):
+            result = attempt_results[idx]
+            record = {
+                "idx": result.get("idx", idx),
+                "prompt": result.get("prompt"),
+                "response": result.get("response"),
+                "extracted_answer": result.get("predicted_answer"),
+                "true_answer": result.get("true_answer"),
+                "correct": result.get("correct"),
+                "input_tokens": result.get("input_tokens"),
+                "output_tokens": result.get("output_tokens"),
+            }
+            if "error" in result:
+                record["error"] = result["error"]
+            f.write(json.dumps(record) + "\n")
+
+    logger.info(f"Attempt {attempt_num} results written to {attempt_file}")
+    return attempt_file
 
 
 def evaluate(
@@ -378,6 +426,7 @@ def evaluate(
     vllm_workers: int = 20,
     attempts: int = 1,
     add_wrapper: bool = False,
+    attempt_output_dir: str | None = None,
 ) -> dict[str, Any]:
     """Run evaluation on the dataset."""
 
@@ -429,6 +478,8 @@ def evaluate(
     samples = load_dataset(dataset_path, num_samples)
     logger.info(f"Will evaluate on {len(samples)} samples")
     logger.info(f"Running {attempts} attempt(s)")
+    if attempt_output_dir:
+        logger.info(f"Per-attempt outputs will be written to {attempt_output_dir}")
 
     # Initialize tracking structures for multiple attempts
     per_sample_results = {i: [] for i in range(len(samples))}  # Track all attempts per sample
@@ -445,6 +496,7 @@ def evaluate(
         logger.info(f"\n{'='*60}")
         logger.info(f"ATTEMPT {attempt_num + 1}/{attempts}")
         logger.info(f"{'='*60}\n")
+        attempt_results = {}
 
         # Use parallel processing for vLLM mode with multiple workers
         if use_vllm and vllm_workers > 1:
@@ -471,7 +523,6 @@ def evaluate(
                 }
 
                 # Collect results as they complete
-                attempt_results = {}
                 completed = 0
                 for future in as_completed(future_to_idx):
                     idx = future_to_idx[future]
@@ -505,6 +556,14 @@ def evaluate(
 
                 per_sample_results[idx].append(result)
                 all_results.append(result)
+                attempt_results[idx] = result
+
+        if attempt_output_dir:
+            write_attempt_results_file(
+                attempt_results=attempt_results,
+                attempt_num=attempt_num + 1,
+                output_dir=attempt_output_dir,
+            )
 
     # Compute final metrics
     total = len(samples)
@@ -736,6 +795,12 @@ def main():
         action="store_true",
         help="Add prefix and suffix to prompts (default: False)",
     )
+    parser.add_argument(
+        "--attempt-output-dir",
+        type=str,
+        default=None,
+        help="Directory to write one JSONL file per attempt with prompt, response, and extracted answer",
+    )
 
     args = parser.parse_args()
 
@@ -774,6 +839,7 @@ def main():
         vllm_workers=args.workers,
         attempts=args.attempts,
         add_wrapper=args.add_prompt_wrapper,
+        attempt_output_dir=args.attempt_output_dir,
     )
 
     # Print summary

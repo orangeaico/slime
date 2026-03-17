@@ -31,10 +31,10 @@ from slime.utils.types import RolloutBatch
 from .cp_utils import (
     all_gather_with_cp,
     get_logits_and_tokens_offset_with_cp,
+    get_sum_of_prompt_weighted_tokens,
     get_sum_of_sample_mean,
     slice_log_prob_with_cp,
 )
-
 
 def get_responses(
     logits: torch.Tensor,
@@ -649,7 +649,7 @@ def policy_loss_function(
     Returns:
         Tuple of `(loss, metrics)` where `loss` is a scalar tensor and `metrics`
         is a dict containing detached scalars: "loss", "pg_loss",
-        "entropy_loss", "pg_clipfrac", "ppo_kl". Additional keys "kl_loss",
+        "entropy_loss", "pg_clipfrac", "ppo_kl", "ratio". Additional keys "kl_loss",
         "tis", "ois", "tis_clipfrac" are included when the respective features
         are enabled.
     """
@@ -722,7 +722,9 @@ def policy_loss_function(
 
     if args.loss_type == "cispo_loss":
         pg_loss, pg_clipfrac = compute_cispo_loss(log_probs, old_log_probs, advantages, args.eps_clip_high)
-        reported_ppo_kl = per_token_ppo_kl.abs()
+        reported_ppo_kl = per_token_ppo_kl
+        ratio = torch.exp(-per_token_ppo_kl)
+
     elif args.loss_type == "dispo_loss":
         pg_loss, pg_clipfrac = compute_dispo_loss(
             log_probs,
@@ -733,10 +735,11 @@ def policy_loss_function(
             args.dispo_neg_eps_clip_low,
             args.dispo_neg_eps_clip_high,
         )
-        reported_ppo_kl = per_token_ppo_kl.abs()
+        reported_ppo_kl = per_token_ppo_kl
+        ratio = torch.exp(-per_token_ppo_kl)
     else:
         pg_loss, pg_clipfrac = compute_policy_loss(policy_ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
-
+        ratio = torch.exp(-policy_ppo_kl)
 
     if args.use_opsm:
         pg_loss = pg_loss * opsm_mask
@@ -783,11 +786,25 @@ def policy_loss_function(
             max_seq_lens,
         )
 
-    # Determine pg_loss reducer: use custom if specified, otherwise default
-    if getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
+    pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
+
+    # Determine pg_loss reducer: use prompt-level reducer, custom reducer, or default.
+    if args.prompt_level_loss_aggregation:
+        if batch.get("prompt_loss_token_weight", None) is None:
+            raise ValueError(
+                "prompt_loss_token_weight is missing from the batch. "
+                "Please regenerate rollout data with --prompt-level-loss-aggregation enabled."
+            )
+        pg_loss_reducer = get_sum_of_prompt_weighted_tokens(
+            total_lengths,
+            response_lengths,
+            pg_loss_masks,
+            batch["prompt_loss_token_weight"],
+            args.qkv_format,
+            max_seq_lens,
+        )
+    elif getattr(args, "custom_pg_loss_reducer_function_path", None) is not None:
         custom_pg_loss_reducer_func = load_function(args.custom_pg_loss_reducer_function_path)
-        # Determine which loss_masks to use for pg_loss reducer
-        pg_loss_masks = modified_response_masks if (args.get_mismatch_metrics or args.use_tis) else batch["loss_masks"]
         pg_loss_reducer = custom_pg_loss_reducer_func(
             total_lengths, response_lengths, pg_loss_masks, args.calculate_per_token_loss
         )
@@ -797,6 +814,7 @@ def policy_loss_function(
     pg_loss = pg_loss_reducer(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(reported_ppo_kl)
+    ratio_mean = sum_of_sample_mean(ratio)
 
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
@@ -836,6 +854,7 @@ def policy_loss_function(
         "entropy_loss": entropy_loss.clone().detach(),
         "pg_clipfrac": pg_clipfrac.clone().detach(),
         "ppo_kl": ppo_kl.clone().detach(),
+        "ratio": ratio_mean.clone().detach(),
     }
 
     if train_rollout_logprob_abs_diff is not None:
@@ -1004,6 +1023,8 @@ def loss_function(
     """
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
     num_samples = len(batch["response_lengths"])
+    global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
+    num_prompt_groups = batch.get("num_prompt_groups", global_batch_size // args.n_samples_per_prompt)
 
     sum_of_sample_mean = get_sum_of_sample_mean(
         batch["total_lengths"],
@@ -1036,8 +1057,9 @@ def loss_function(
         loss, log = func(args, batch, logits, sum_of_sample_mean)
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
-    global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
-    if not args.calculate_per_token_loss:
+    if args.prompt_level_loss_aggregation:
+        loss = loss * num_microbatches / num_prompt_groups * mpu.get_data_parallel_world_size(with_context_parallel=True)
+    elif not args.calculate_per_token_loss:
         loss = (
             loss * num_microbatches / global_batch_size * mpu.get_data_parallel_world_size(with_context_parallel=True)
         )
@@ -1046,12 +1068,18 @@ def loss_function(
 
     return (
         loss,
-        (num_tokens if args.calculate_per_token_loss else torch.tensor(1, device=logits.device)),
+        (
+            num_tokens
+            if (args.calculate_per_token_loss and not args.prompt_level_loss_aggregation)
+            else torch.tensor(1, device=logits.device)
+        ),
         {
             "keys": list(log.keys()),
             "values": torch.tensor(
                 [
-                    num_samples if not args.calculate_per_token_loss else num_tokens,
+                    num_prompt_groups
+                    if args.prompt_level_loss_aggregation
+                    else (num_samples if not args.calculate_per_token_loss else num_tokens),
                 ]
                 + list(log.values()),
                 device=logits.device,

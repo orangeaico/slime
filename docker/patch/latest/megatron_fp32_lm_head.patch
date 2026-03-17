@@ -1,0 +1,594 @@
+--- a/megatron/training/arguments.py
++++ b/megatron/training/arguments.py
+@@ -2298,6 +2298,8 @@
+     group.add_argument('--cross-entropy-fusion-impl', type=str, default='native',
+                        choices=['native', 'te', 'linear'],
+                        help='Implementation of cross entropy loss calculation.')
++    group.add_argument('--fp32-lm-head', action='store_true',
++                       help='Cast LM head hidden states and weights to fp32 at logits compute time.')
+     group.add_argument('--use-flash-attn', action='store_true',
+                        help='use FlashAttention implementation of attention. '
+                        'https://arxiv.org/abs/2205.14135')
+--- a/megatron/training/yaml_arguments.py
++++ b/megatron/training/yaml_arguments.py
+@@ -403,6 +403,8 @@
+ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):    
+     # Combine transfomer config with model parallel args
+     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
++    if not hasattr(args, "fp32_lm_head"):
++        args.fp32_lm_head = False
+     # Translate args to core transformer configuration
+     kw_args = core_config_from_args(args, TransformerConfig)    
+     
+@@ -448,4 +450,3 @@
+         # Add config location to namespace
+         config_namespace.yaml_cfg = yaml_path
+         return config_namespace
+-
+--- a/megatron/core/transformer/transformer_config.py
++++ b/megatron/core/transformer/transformer_config.py
+@@ -135,6 +135,9 @@
+     fp32_residual_connection: bool = False
+     """If true, move residual connections to fp32."""
+ 
++    fp32_lm_head: bool = False
++    """If true, cast LM head inputs and weights to fp32 for logits computation."""
++
+     # @jcasper should we keep this option?
+     apply_residual_connection_post_layernorm: bool = False
+     """If True, uses the original BERT residule connection ordering."""
+--- a/megatron/core/models/common/language_module/language_module.py
++++ b/megatron/core/models/common/language_module/language_module.py
+@@ -167,6 +167,9 @@
+             ), "labels cannot be None when using fused linear cross entropy."
+             # [b s] => [s b]
+             labels = labels.transpose(0, 1).contiguous()
++            if self.config.fp32_lm_head:
++                hidden = hidden.to(torch.float32)
++                weight = weight.to(torch.float32)
+             loss = linear_cross_entropy(
+                 hidden,
+                 weight,
+@@ -184,18 +187,47 @@
+             assert (
+                 column_parallel_linear is not None
+             ), "column_parallel_linear cannot be None when not using fused linear cross entropy."
+-            # output
+-            output_layer_params = {k: v.detach() for k, v in column_parallel_linear.named_parameters()}
+-            output_layer_buffers = dict(column_parallel_linear.named_buffers())
+-            logits, _ = torch.func.functional_call(
+-                column_parallel_linear,
+-                {**output_layer_params, **output_layer_buffers},
+-                (hidden,),
+-                col_linear_kwargs,
++            logits = self.compute_output_layer_logits(
++                hidden,
++                column_parallel_linear=column_parallel_linear,
++                col_linear_kwargs=col_linear_kwargs,
+             )
+ 
+             return self.compute_language_model_loss(labels, logits)
+ 
++    def compute_output_layer_logits(
++        self,
++        hidden: Tensor,
++        column_parallel_linear: torch.nn.Module,
++        col_linear_kwargs: Optional[Dict[str, Any]] = None,
++    ) -> Tensor:
++        """Computes logits through the LM head, optionally casting compute to fp32."""
++        col_linear_kwargs = dict(col_linear_kwargs or {})
++        output_weight = col_linear_kwargs.pop("weight", None)
++
++        if not self.config.fp32_lm_head:
++            logits, _ = column_parallel_linear(hidden, weight=output_weight, **col_linear_kwargs)
++            return logits
++
++        hidden = hidden.to(torch.float32)
++        if output_weight is None:
++            output_weight = column_parallel_linear.weight
++        output_weight = output_weight.to(torch.float32)
++
++        original_gradient_accumulation_fusion = column_parallel_linear.gradient_accumulation_fusion
++        column_parallel_linear.gradient_accumulation_fusion = False
++        try:
++            logits, _ = column_parallel_linear(
++                hidden,
++                weight=output_weight,
++                **col_linear_kwargs,
++            )
++        finally:
++            column_parallel_linear.gradient_accumulation_fusion = (
++                original_gradient_accumulation_fusion
++            )
++        return logits
++
+     def compute_language_model_loss(self, labels: Tensor, logits: Tensor) -> Tensor:
+         """Computes the language model loss (Cross entropy across vocabulary)
+ 
+--- a/megatron/core/models/gpt/gpt_model.py
++++ b/megatron/core/models/gpt/gpt_model.py
+@@ -604,7 +604,7 @@
+                     sequence_parallel_enabled=self.output_layer.sequence_parallel,
+                     column_parallel_linear=self.output_layer,
+                     col_linear_kwargs={
+-                        'weight': output_weight.detach() if output_weight else None,
++                        'weight': output_weight.detach() if output_weight is not None else None,
+                         'runtime_gather_output': runtime_gather_output,
+                     },
+                 )
+@@ -654,8 +654,13 @@
+                 ).unsqueeze(1)
+ 
+         if has_config_logger_enabled(self.config) or labels is None:
+-            logits, _ = self.output_layer(
+-                hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
++            logits = self.compute_output_layer_logits(
++                hidden_states,
++                column_parallel_linear=self.output_layer,
++                col_linear_kwargs={
++                    'weight': output_weight,
++                    'runtime_gather_output': runtime_gather_output,
++                },
+             )
+         else:
+             logits = None
+--- a/megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py
++++ b/megatron/core/inference/model_inference_wrappers/abstract_model_inference_wrapper.py
+@@ -60,6 +60,7 @@
+             else self.inference_wrapper_config.params_dtype
+         )
+         model_config = get_model_config(self.model)
++        self.model_config = model_config
+         self.sequence_parallel = model_config.sequence_parallel
+ 
+         if inference_context is None:
+@@ -254,7 +255,8 @@
+             logits = output_tensor
+ 
+             # Explicitly cast logits to expected dtype
+-            logits = logits.to(self.inference_wrapper_config.params_dtype)
++            if not self.model_config.fp32_lm_head:
++                logits = logits.to(self.inference_wrapper_config.params_dtype)
+ 
+         return logits
+ 
+@@ -295,7 +297,7 @@
+             logits_seq_len = 1 if materialize_only_last_token_logits else seq_len
+             logits = torch.empty(
+                 (batch_size, logits_seq_len, self.inference_wrapper_config.padded_vocab_size),
+-                dtype=self.pipeline_communication_dtype,
++                dtype=torch.float32 if self.model_config.fp32_lm_head else self.pipeline_communication_dtype,
+                 device=torch.cuda.current_device(),
+             )
+ 
+@@ -339,7 +341,8 @@
+         # Explicitly cast logits to expected dtype
+         if is_pipeline_last_stage(self.pp_group):
+             assert logits is not None
+-            logits = logits.to(self.inference_wrapper_config.params_dtype)
++            if not self.model_config.fp32_lm_head:
++                logits = logits.to(self.inference_wrapper_config.params_dtype)
+ 
+         # Once done with all micro batches, we reset batch size offset and seq len offset
+         self.inference_context.increment_sequence_len_offset(seq_len)
+--- a/tests/unit_tests/models/test_gpt_model.py
++++ b/tests/unit_tests/models/test_gpt_model.py
+@@ -6,12 +6,14 @@
+ 
+ import pytest
+ import torch
++import megatron.core.models.common.language_module.language_module as language_module_module
+ from packaging import version
+ from pytest import approx
+ 
+ from megatron.core import parallel_state
+ from megatron.core.hyper_comm_grid import HyperCommGrid
+ from megatron.core.models.gpt.gpt_layer_specs import (
++    get_gpt_layer_local_spec,
+     get_gpt_layer_with_transformer_engine_spec,
+     get_mlp_module_spec,
+ )
+@@ -23,6 +25,31 @@
+ from tests.unit_tests.test_utilities import Utils
+ 
+ 
++def _build_fp32_lm_head_gpt_model(
++    params_dtype,
++    fp32_lm_head,
++    *,
++    share_embeddings_and_output_weights=False,
++    **config_overrides,
++):
++    transformer_config = TransformerConfig(
++        num_layers=2,
++        hidden_size=12,
++        num_attention_heads=4,
++        params_dtype=params_dtype,
++        fp32_lm_head=fp32_lm_head,
++        use_cpu_initialization=True,
++        **config_overrides,
++    )
++    return GPTModel(
++        config=transformer_config,
++        transformer_layer_spec=get_gpt_layer_local_spec(),
++        vocab_size=100,
++        max_sequence_length=4,
++        share_embeddings_and_output_weights=share_embeddings_and_output_weights,
++    ).cuda()
++
++
+ class TestGPTModel:
+ 
+     def setup_method(self, method):
+@@ -106,6 +133,257 @@
+         assert logits.shape[2] == self.gpt_model.vocab_size
+ 
+ 
++@pytest.mark.parametrize("params_dtype", [torch.float16, torch.bfloat16])
++@pytest.mark.parametrize("share_embeddings_and_output_weights", [False, True])
++@pytest.mark.parametrize("fp32_lm_head", [False, True])
++def test_fp32_lm_head_casts_output_layer_logits_compute(
++    params_dtype,
++    share_embeddings_and_output_weights,
++    fp32_lm_head,
++    monkeypatch,
++):
++    os.environ.pop('NVTE_FUSED_ATTN', None)
++    os.environ.pop('NVTE_FLASH_ATTN', None)
++    os.environ.pop('NVTE_UNFUSED_ATTN', None)
++    Utils.initialize_model_parallel(1, 1)
++    model_parallel_cuda_manual_seed(123)
++
++    try:
++        gpt_model = _build_fp32_lm_head_gpt_model(
++            params_dtype,
++            fp32_lm_head,
++            share_embeddings_and_output_weights=share_embeddings_and_output_weights,
++        )
++        hidden_states = torch.randn(
++            gpt_model.max_sequence_length,
++            2,
++            gpt_model.config.hidden_size,
++            device=torch.cuda.current_device(),
++            dtype=params_dtype,
++        )
++        output_weight = (
++            gpt_model.shared_embedding_or_output_weight()
++            if share_embeddings_and_output_weights
++            else None
++        )
++
++        state = {"input_dtype": None, "weight_dtype": None}
++        original_forward_impl = gpt_model.output_layer._forward_impl
++
++        def probe_forward_impl(input, weight, *args, **kwargs):
++            if state["input_dtype"] is None:
++                state["input_dtype"] = input.dtype
++                state["weight_dtype"] = weight.dtype
++            return original_forward_impl(input, weight, *args, **kwargs)
++
++        monkeypatch.setattr(gpt_model.output_layer, "_forward_impl", probe_forward_impl)
++        logits = gpt_model.compute_output_layer_logits(
++            hidden_states,
++            column_parallel_linear=gpt_model.output_layer,
++            col_linear_kwargs={
++                'weight': output_weight,
++                'runtime_gather_output': True,
++            },
++        )
++
++        expected_compute_dtype = torch.float32 if fp32_lm_head else params_dtype
++        assert state["input_dtype"] == expected_compute_dtype
++        assert state["weight_dtype"] == expected_compute_dtype
++        assert logits.dtype == expected_compute_dtype
++
++        stored_weight = output_weight if output_weight is not None else gpt_model.output_layer.weight
++        assert stored_weight.dtype == params_dtype
++    finally:
++        Utils.destroy_model_parallel()
++
++
++@pytest.mark.parametrize("params_dtype", [torch.float16, torch.bfloat16])
++@pytest.mark.parametrize("share_embeddings_and_output_weights", [False, True])
++@pytest.mark.parametrize("fp32_lm_head", [False, True])
++def test_fp32_lm_head_casts_output_layer_loss_compute(
++    params_dtype,
++    share_embeddings_and_output_weights,
++    fp32_lm_head,
++    monkeypatch,
++):
++    os.environ.pop('NVTE_FUSED_ATTN', None)
++    os.environ.pop('NVTE_FLASH_ATTN', None)
++    os.environ.pop('NVTE_UNFUSED_ATTN', None)
++    Utils.initialize_model_parallel(1, 1)
++    model_parallel_cuda_manual_seed(123)
++
++    try:
++        gpt_model = _build_fp32_lm_head_gpt_model(
++            params_dtype,
++            fp32_lm_head,
++            share_embeddings_and_output_weights=share_embeddings_and_output_weights,
++        )
++        hidden_states = torch.randn(
++            gpt_model.max_sequence_length,
++            2,
++            gpt_model.config.hidden_size,
++            device=torch.cuda.current_device(),
++            dtype=params_dtype,
++        )
++        labels = torch.randint(
++            low=0,
++            high=gpt_model.vocab_size,
++            size=(2, gpt_model.max_sequence_length),
++            device=torch.cuda.current_device(),
++        )
++        output_weight = (
++            gpt_model.shared_embedding_or_output_weight()
++            if share_embeddings_and_output_weights
++            else None
++        )
++
++        state = {"input_dtype": None, "weight_dtype": None, "logits_dtype": None}
++        original_forward_impl = gpt_model.output_layer._forward_impl
++
++        def probe_forward_impl(input, weight, *args, **kwargs):
++            if state["input_dtype"] is None:
++                state["input_dtype"] = input.dtype
++                state["weight_dtype"] = weight.dtype
++            return original_forward_impl(input, weight, *args, **kwargs)
++
++        def fake_compute_language_model_loss(labels, logits):
++            state["logits_dtype"] = logits.dtype
++            return torch.zeros_like(labels, dtype=logits.dtype)
++
++        monkeypatch.setattr(gpt_model.output_layer, "_forward_impl", probe_forward_impl)
++        monkeypatch.setattr(gpt_model, "compute_language_model_loss", fake_compute_language_model_loss)
++
++        loss = gpt_model.compute_output_layer_and_language_model_loss(
++            hidden_states,
++            labels=labels,
++            weight=gpt_model.output_layer.weight,
++            sequence_parallel_enabled=gpt_model.output_layer.sequence_parallel,
++            column_parallel_linear=gpt_model.output_layer,
++            col_linear_kwargs={
++                'weight': output_weight,
++                'runtime_gather_output': True,
++            },
++        )
++
++        expected_compute_dtype = torch.float32 if fp32_lm_head else params_dtype
++        assert state["input_dtype"] == expected_compute_dtype
++        assert state["weight_dtype"] == expected_compute_dtype
++        assert state["logits_dtype"] == expected_compute_dtype
++        assert loss.shape == labels.shape
++
++        stored_weight = output_weight if output_weight is not None else gpt_model.output_layer.weight
++        assert stored_weight.dtype == params_dtype
++    finally:
++        Utils.destroy_model_parallel()
++
++
++@pytest.mark.parametrize("params_dtype", [torch.float16, torch.bfloat16])
++@pytest.mark.parametrize("fp32_lm_head", [False, True])
++def test_fp32_lm_head_casts_linear_cross_entropy_inputs(
++    params_dtype,
++    fp32_lm_head,
++    monkeypatch,
++):
++    os.environ.pop('NVTE_FUSED_ATTN', None)
++    os.environ.pop('NVTE_FLASH_ATTN', None)
++    os.environ.pop('NVTE_UNFUSED_ATTN', None)
++    Utils.initialize_model_parallel(1, 1)
++    model_parallel_cuda_manual_seed(123)
++
++    try:
++        gpt_model = _build_fp32_lm_head_gpt_model(
++            params_dtype,
++            fp32_lm_head,
++            cross_entropy_loss_fusion=True,
++            cross_entropy_fusion_impl='linear',
++        )
++        hidden_states = torch.randn(
++            gpt_model.max_sequence_length,
++            2,
++            gpt_model.config.hidden_size,
++            device=torch.cuda.current_device(),
++            dtype=params_dtype,
++        )
++        labels = torch.randint(
++            low=0,
++            high=gpt_model.vocab_size,
++            size=(2, gpt_model.max_sequence_length),
++            device=torch.cuda.current_device(),
++        )
++        state = {"input_dtype": None, "weight_dtype": None}
++
++        def fake_linear_cross_entropy(hidden, weight, labels, **kwargs):
++            state["input_dtype"] = hidden.dtype
++            state["weight_dtype"] = weight.dtype
++            return torch.zeros_like(labels, dtype=hidden.dtype)
++
++        monkeypatch.setattr(language_module_module, "linear_cross_entropy", fake_linear_cross_entropy)
++
++        loss = gpt_model.compute_output_layer_and_language_model_loss(
++            hidden_states,
++            labels=labels,
++            weight=gpt_model.output_layer.weight,
++            sequence_parallel_enabled=gpt_model.output_layer.sequence_parallel,
++            column_parallel_linear=gpt_model.output_layer,
++        )
++
++        expected_compute_dtype = torch.float32 if fp32_lm_head else params_dtype
++        assert state["input_dtype"] == expected_compute_dtype
++        assert state["weight_dtype"] == expected_compute_dtype
++        assert loss.shape == labels.shape
++        assert gpt_model.output_layer.weight.dtype == params_dtype
++    finally:
++        Utils.destroy_model_parallel()
++
++
++@pytest.mark.parametrize("share_embeddings_and_output_weights", [False, True])
++def test_fp32_lm_head_output_layer_backward_keeps_weight_in_graph(
++    share_embeddings_and_output_weights,
++):
++    os.environ.pop('NVTE_FUSED_ATTN', None)
++    os.environ.pop('NVTE_FLASH_ATTN', None)
++    os.environ.pop('NVTE_UNFUSED_ATTN', None)
++    Utils.initialize_model_parallel(1, 1)
++    model_parallel_cuda_manual_seed(123)
++
++    try:
++        gpt_model = _build_fp32_lm_head_gpt_model(
++            torch.bfloat16,
++            True,
++            share_embeddings_and_output_weights=share_embeddings_and_output_weights,
++        )
++        hidden_states = torch.randn(
++            gpt_model.max_sequence_length,
++            2,
++            gpt_model.config.hidden_size,
++            device=torch.cuda.current_device(),
++            dtype=torch.bfloat16,
++            requires_grad=True,
++        )
++        output_weight = (
++            gpt_model.shared_embedding_or_output_weight()
++            if share_embeddings_and_output_weights
++            else gpt_model.output_layer.weight
++        )
++        output_weight.main_grad = None
++        output_weight.grad_added_to_main_grad = False
++
++        logits = gpt_model.compute_output_layer_logits(
++            hidden_states,
++            column_parallel_linear=gpt_model.output_layer,
++            col_linear_kwargs={
++                'weight': output_weight,
++                'runtime_gather_output': True,
++            },
++        )
++        logits.float().sum().backward()
++
++        assert hidden_states.grad is not None
++        assert output_weight.grad is not None
++    finally:
++        Utils.destroy_model_parallel()
++
++
+ def test_get_mlp_module_spec_interface():
+     # Get the function signature
+     sig = inspect.signature(get_mlp_module_spec)
+--- a/tests/unit_tests/inference/model_inference_wrappers/gpt/test_gpt_inference_wrapper.py
++++ b/tests/unit_tests/inference/model_inference_wrappers/gpt/test_gpt_inference_wrapper.py
+@@ -1,7 +1,5 @@
+ # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ 
+-from argparse import Namespace
+-
+ import pytest
+ import torch
+ 
+@@ -13,10 +11,7 @@
+ from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
+     InferenceWrapperConfig,
+ )
+-from megatron.core.models.gpt.gpt_layer_specs import (
+-    get_gpt_layer_local_spec,
+-    get_gpt_layer_with_transformer_engine_spec,
+-)
++from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+ from megatron.core.models.gpt.gpt_model import GPTModel
+ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+ from megatron.core.transformer.transformer_config import TransformerConfig
+@@ -25,7 +20,14 @@
+ 
+ class TestGPTInferenceWrapper:
+ 
+-    def setup_model(self, tensor_parallel_size, pipeline_parallel_size):
++    def setup_model(
++        self,
++        tensor_parallel_size,
++        pipeline_parallel_size,
++        *,
++        params_dtype=torch.float,
++        fp32_lm_head=False,
++    ):
+         Utils.initialize_model_parallel(
+             tensor_model_parallel_size=tensor_parallel_size,
+             pipeline_model_parallel_size=pipeline_parallel_size,
+@@ -40,6 +42,8 @@
+             num_layers=4,
+             hidden_size=hidden_size,
+             num_attention_heads=4,
++            params_dtype=params_dtype,
++            fp32_lm_head=fp32_lm_head,
+             use_cpu_initialization=True,
+         )
+ 
+@@ -58,7 +62,7 @@
+             inference_batch_times_seqlen_threshold=20,
+             inference_max_requests=self.batch_size,
+             fp32_residual_connection=False,
+-            params_dtype=torch.float,
++            params_dtype=params_dtype,
+             padded_vocab_size=self.vocab_size,
+         )
+ 
+@@ -176,3 +180,57 @@
+             logits_seq_len,
+             self.vocab_size,
+         ), f"Shape mismatch . Expected {(self.batch_size, logits_seq_len, self.vocab_size)}, but got {logits.shape}"
++
++    @pytest.mark.parametrize("fp32_lm_head", [False, True])
++    @pytest.mark.parametrize("forward_path", ["small", "large"])
++    def test_fp32_lm_head_preserves_inference_logits_dtype(
++        self,
++        fp32_lm_head,
++        forward_path,
++        monkeypatch,
++    ):
++        self.setup_model(
++            tensor_parallel_size=1,
++            pipeline_parallel_size=1,
++            params_dtype=torch.bfloat16,
++            fp32_lm_head=fp32_lm_head,
++        )
++
++        batch_prompt_tokens = (
++            torch.randint(low=0, high=self.vocab_size, size=(self.batch_size, self.sequence_length))
++            .int()
++            .cuda()
++        )
++        self.inference_wrapped_model.prep_model_for_inference()
++        self.inference_wrapped_model.inference_context.materialize_only_last_token_logits = False
++        inference_input = self.inference_wrapped_model.prep_inference_input(
++            prompts_tokens=batch_prompt_tokens
++        )
++        expected_dtype = torch.float32 if fp32_lm_head else torch.bfloat16
++
++        def fake_forward(inference_input):
++            tokens = inference_input["tokens"]
++            return torch.ones(
++                (tokens.size(0), tokens.size(1), self.vocab_size),
++                dtype=expected_dtype,
++                device=tokens.device,
++            )
++
++        monkeypatch.setattr(self.inference_wrapped_model, "_forward", fake_forward)
++
++        if forward_path == "small":
++            inference_input_for_context_window = (
++                self.inference_wrapped_model.get_batch_for_context_window(inference_input, 0, 5)
++            )
++            logits = self.inference_wrapped_model.forward_pass_with_pipeline_parallel_small_input_batch(
++                inference_input_for_context_window
++            )
++        else:
++            inference_input_for_context_window = (
++                self.inference_wrapped_model.get_batch_for_context_window(inference_input, 0, 10)
++            )
++            logits = self.inference_wrapped_model.forward_pass_with_pipeline_parallel_large_input_batch(
++                inference_input_for_context_window
++            )
++
++        assert logits.dtype == expected_dtype

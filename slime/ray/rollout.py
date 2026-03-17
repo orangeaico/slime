@@ -22,6 +22,13 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.scalerl_utils import (
+    get_batch_normalized_prompt_rewards,
+    get_prompt_group_indices,
+    get_prompt_group_mean_centered_rewards,
+    get_prompt_loss_token_weights,
+    get_required_prompt_group_multiple,
+)
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
 
@@ -32,6 +39,41 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _requires_prompt_group_alignment(args) -> bool:
+    return args.batch_level_normalization or args.prompt_level_loss_aggregation
+
+
+def _get_sample_group_indices(samples: list[Sample], n_samples_per_prompt: int) -> list[int]:
+    return get_prompt_group_indices([sample.group_index for sample in samples], n_samples_per_prompt)
+
+
+def _get_dp_partitions(
+    total_lengths: list[int],
+    *,
+    dp_size: int,
+    balance_data: bool,
+    global_batch_size: int,
+    preserve_step_boundaries: bool,
+) -> list[list[int] | range]:
+    if not preserve_step_boundaries:
+        if balance_data:
+            return get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
+        return [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
+
+    partitions = [[] for _ in range(dp_size)]
+    for step_start in range(0, len(total_lengths), global_batch_size):
+        step_total_lengths = total_lengths[step_start : step_start + global_batch_size]
+        if balance_data:
+            step_partitions = get_seqlen_balanced_partitions(step_total_lengths, dp_size, equal_size=True)
+        else:
+            step_partitions = [range(i, len(step_total_lengths), dp_size) for i in range(dp_size)]
+
+        for rank in range(dp_size):
+            partitions[rank].extend(step_start + local_idx for local_idx in step_partitions[rank])
+
+    return partitions
 
 
 @dataclasses.dataclass
@@ -452,21 +494,31 @@ class RolloutManager:
         """
         dp_size = self.train_parallel_config["dp_size"]
         original_gbs = self.args.global_batch_size
+        required_multiple = get_required_prompt_group_multiple(
+            dp_size=dp_size,
+            n_samples_per_prompt=self.args.n_samples_per_prompt,
+            require_prompt_group_alignment=_requires_prompt_group_alignment(self.args),
+        )
 
-        # Round down to a multiple of dp_size to ensure only one training step
-        dynamic_gbs = (num_samples // dp_size) * dp_size
+        # Round down to a multiple of dp_size (and prompt group size when needed)
+        dynamic_gbs = (num_samples // required_multiple) * required_multiple
 
         if dynamic_gbs == 0:
-            # Too few samples, use at least dp_size
-            dynamic_gbs = dp_size
-            logger.warning(f"num_samples={num_samples} < dp_size={dp_size}, using dp_size as global_batch_size")
+            # Too few samples, use at least the required multiple and let trim validation raise if still insufficient.
+            dynamic_gbs = required_multiple
+            logger.warning(
+                f"num_samples={num_samples} < required_multiple={required_multiple}, "
+                f"using required_multiple as global_batch_size"
+            )
 
         # Calculate how many samples will be discarded
         wasted = num_samples - dynamic_gbs
 
         if dynamic_gbs != original_gbs or wasted > 0:
             logger.info(
-                f"Dynamic global_batch_size: {original_gbs} -> {dynamic_gbs} (num_samples={num_samples}, dp_size={dp_size}, num_steps=1, wasted={wasted})"
+                f"Dynamic global_batch_size: {original_gbs} -> {dynamic_gbs} "
+                f"(num_samples={num_samples}, dp_size={dp_size}, required_multiple={required_multiple}, "
+                f"num_steps=1, wasted={wasted})"
             )
 
         return dynamic_gbs
@@ -495,6 +547,7 @@ class RolloutManager:
             return self.custom_reward_post_process_func(self.args, samples)
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+        group_indices = _get_sample_group_indices(samples, self.args.n_samples_per_prompt)
         logger.info(f"[DEBUG] Raw rewards (extracted from samples): {raw_rewards}")
         logger.info(f"[DEBUG] Raw rewards stats: min={min(raw_rewards)}, max={max(raw_rewards)}, mean={sum(raw_rewards)/len(raw_rewards)}")
 
@@ -502,34 +555,29 @@ class RolloutManager:
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
-            # group norm
-            rewards = torch.tensor(raw_rewards, dtype=torch.float)
-            # logger.info(f"[DEBUG] Rewards tensor before reshape: {rewards}")
+            centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices)
+            logger.info(f"[DEBUG] Mean-centered rewards by group: {centered_rewards}")
 
-            if rewards.shape[-1] == self.args.n_samples_per_prompt * self.args.rollout_batch_size:
-                rewards = rewards.reshape(-1, self.args.n_samples_per_prompt)
+            if self.args.batch_level_normalization:
+                normalized_rewards = get_batch_normalized_prompt_rewards(raw_rewards, group_indices)
+                logger.info(f"[DEBUG] Rewards after batch-level normalization: {normalized_rewards}")
+            elif self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+                normalized_rewards = centered_rewards.clone()
+                grouped_indices = group_by(list(range(len(group_indices))), lambda idx: group_indices[idx])
+                for group_sample_indices in grouped_indices.values():
+                    group_rewards = centered_rewards[group_sample_indices]
+                    group_std = group_rewards.std()
+                    normalized_rewards[group_sample_indices] = group_rewards / (group_std + 1e-6)
+                normalized_rewards = normalized_rewards.tolist()
+                logger.info(f"[DEBUG] Rewards after prompt-level std division: {normalized_rewards}")
             else:
-                # when samples count are not equal in each group
-                rewards = rewards.view(-1, rewards.shape[-1])
+                normalized_rewards = centered_rewards.tolist()
+                logger.info(
+                    f"[DEBUG] Skipping std normalization "
+                    f"(batch_level_normalization={self.args.batch_level_normalization}, "
+                    f"grpo_std_normalization={self.args.grpo_std_normalization})"
+                )
 
-            # logger.info(f"[DEBUG] Rewards tensor after reshape: {rewards}")
-
-            mean = rewards.mean(dim=-1, keepdim=True)
-            logger.info(f"[DEBUG] Mean per group: {mean}")
-
-            rewards = rewards - mean
-            # logger.info(f"[DEBUG] Rewards after mean subtraction: {rewards}")
-
-            if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                std = rewards.std(dim=-1, keepdim=True)
-                # logger.info(f"[DEBUG] Std per group: {std}")
-                rewards = rewards / (std + 1e-6)
-                logger.info(f"[DEBUG] Rewards after std division: {rewards}")
-            else:
-                logger.info(f"[DEBUG] Skipping std normalization (grpo_std_normalization={self.args.grpo_std_normalization})")
-
-            normalized_rewards = rewards.flatten().tolist()
-            # logger.info(f"[DEBUG] Final normalized rewards: {normalized_rewards}")
             logger.info(f"[DEBUG] Sum of normalized rewards: {sum(normalized_rewards)}, Mean: {sum(normalized_rewards)/len(normalized_rewards)}")
             return raw_rewards, normalized_rewards
 
@@ -557,6 +605,7 @@ class RolloutManager:
             "raw_reward": raw_rewards,
             "truncated": [1 if sample.status == Sample.Status.TRUNCATED else 0 for sample in samples],
             "sample_indices": [sample.index for sample in samples],
+            "group_index": _get_sample_group_indices(samples, self.args.n_samples_per_prompt),
         }
 
         # loss mask
@@ -574,6 +623,12 @@ class RolloutManager:
                 sample.loss_mask = [0] * sample.response_length
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
+
+        if self.args.prompt_level_loss_aggregation:
+            prompt_loss_token_weight, _ = get_prompt_loss_token_weights(loss_masks, train_data["group_index"])
+            global_batch_size = getattr(self, "_dynamic_global_batch_size", self.args.global_batch_size)
+            train_data["prompt_loss_token_weight"] = prompt_loss_token_weight
+            train_data["num_prompt_groups"] = global_batch_size // self.args.n_samples_per_prompt
 
         # overwriting the raw reward
         if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -613,11 +668,15 @@ class RolloutManager:
 
         total_lengths = [len(t) for t in data["tokens"]]
         data["total_lengths"] = total_lengths
+        global_batch_size = data.get("dynamic_global_batch_size", getattr(self, "_dynamic_global_batch_size", self.args.global_batch_size))
 
-        if self.args.balance_data:
-            partitions = get_seqlen_balanced_partitions(total_lengths, dp_size, equal_size=True)
-        else:
-            partitions = [range(i, len(total_lengths), dp_size) for i in range(dp_size)]
+        partitions = _get_dp_partitions(
+            total_lengths,
+            dp_size=dp_size,
+            balance_data=self.args.balance_data,
+            global_batch_size=global_batch_size,
+            preserve_step_boundaries=self.args.prompt_level_loss_aggregation,
+        )
 
         rollout_data_refs = []
 
@@ -632,6 +691,8 @@ class RolloutManager:
                 "rewards",
                 "truncated",
                 "loss_masks",
+                "group_index",
+                "prompt_loss_token_weight",
                 "round_number",
                 "sample_indices",
                 "rollout_log_probs",
@@ -647,6 +708,7 @@ class RolloutManager:
             for key in [
                 "raw_reward",
                 "total_lengths",
+                "num_prompt_groups",
             ]:
                 if key not in data:
                     continue

@@ -45,7 +45,6 @@ LOSS_SPECIFIC_ARGS=()
 if [ "${LOSS_TYPE}" = "cispo_loss" ]; then
    LOSS_SPECIFIC_ARGS=(
       --eps-clip-high ${CISPO_EPS_CLIP_HIGH}
-      --calculate-per-token-loss
    )
 elif [ "${LOSS_TYPE}" = "dispo_loss" ]; then
    LOSS_SPECIFIC_ARGS=(
@@ -53,15 +52,12 @@ elif [ "${LOSS_TYPE}" = "dispo_loss" ]; then
       --dispo-pos-eps-clip-high ${DISPO_POS_EPS_CLIP_HIGH}
       --dispo-neg-eps-clip-low ${DISPO_NEG_EPS_CLIP_LOW}
       --dispo-neg-eps-clip-high ${DISPO_NEG_EPS_CLIP_HIGH}
-      --calculate-per-token-loss
    )
 else
    LOSS_SPECIFIC_ARGS=(
       --eps-clip-high 0.28
    )
 fi
-
-
    
 CKPT_ARGS=(
    --hf-checkpoint /root/data/hf_models/Qwen3-0.6B_rl_grpo_non_think_7473_4_steps
@@ -140,6 +136,8 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    ${LOSS_ARGS[@]}
+   # --batch-level-normalization
+   # --prompt-level-loss-aggregation
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -170,6 +168,7 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.8
    --partial-rollout
+   # --sglang-enable-fp32-lm-head
 )
 
 
@@ -179,6 +178,7 @@ MISC_ARGS=(
    --attention-backend flash
    --cross-entropy-loss-fusion
    --cross-entropy-fusion-impl te
+# --fp32-lm-head
    --bf16
    --use-distributed-optimizer
    --use-precision-aware-optimizer

@@ -11,6 +11,7 @@ from slime.backends.sglang_utils.arguments import sglang_parse_args
 from slime.backends.sglang_utils.arguments import validate_args as sglang_validate_args
 from slime.utils.eval_config import EvalDatasetConfig, build_eval_dataset_configs, ensure_dataset_list
 from slime.utils.logging_utils import configure_logger
+from slime.utils.scalerl_utils import should_force_per_token_loss, validate_scalerl_args
 
 logger = logging.getLogger(__name__)
 
@@ -891,6 +892,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
+                "--batch-level-normalization",
+                action="store_true",
+                default=False,
+                help=(
+                    "Use ScaleRL-style batch normalization for GRPO/GSPO rewards: subtract the prompt-group mean, "
+                    "then divide by the standard deviation of all centered rewards in the batch."
+                ),
+            )
+            parser.add_argument(
+                "--prompt-level-loss-aggregation",
+                action="store_true",
+                default=False,
+                help=(
+                    "Aggregate pg_loss at the prompt level by precomputing each prompt's valid-token denominator "
+                    "from rollout loss masks and averaging prompt losses equally."
+                ),
+            )
+            parser.add_argument(
                 "--disable-grpo-std-normalization",
                 action="store_false",
                 dest="grpo_std_normalization",
@@ -1696,9 +1715,12 @@ def slime_validate_args(args):
                 "--dispo-pos-eps-clip-low, --dispo-pos-eps-clip-high, "
                 "--dispo-neg-eps-clip-low, --dispo-neg-eps-clip-high."
             )
-        args.calculate_per_token_loss = True
+        if should_force_per_token_loss(args.loss_type, args.prompt_level_loss_aggregation):
+            args.calculate_per_token_loss = True
 
     if args.loss_type == "cispo_loss":
+        if should_force_per_token_loss(args.loss_type, args.prompt_level_loss_aggregation):
+            args.calculate_per_token_loss = True
         if args.eps_clip_high is None:
             args.eps_clip_high = 5.0
     elif args.eps_clip_high is None:
@@ -1781,6 +1803,8 @@ def slime_validate_args(args):
                 f"// num_steps_per_rollout {args.num_steps_per_rollout}"
             )
         args.global_batch_size = global_batch_size
+
+    validate_scalerl_args(args)
 
     if args.n_samples_per_prompt == 1:
         args.grpo_std_normalization = False

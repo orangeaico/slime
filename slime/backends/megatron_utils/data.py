@@ -268,6 +268,8 @@ class DataIterator:
             vals = self.rollout_data.get(key, None)
             if vals is None:
                 batch[key] = None
+            elif not isinstance(vals, list):
+                batch[key] = vals
             else:
                 if self.micro_batch_indices is not None:
                     indices = self.micro_batch_indices[self.offset]
@@ -417,6 +419,9 @@ def log_rollout_data(
                 "multimodal_train_inputs",
                 "loss_masks",
                 "sample_indices",
+                "group_index",
+                "prompt_loss_token_weight",
+                "num_prompt_groups",
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
