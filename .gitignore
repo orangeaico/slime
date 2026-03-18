@@ -193,4 +193,7 @@ _examples_synced/
 .env
 .DS_Store
 commands.sh
+examples/digital_twin/data/
+plans/
+
 logs/
