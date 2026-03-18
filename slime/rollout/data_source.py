@@ -6,12 +6,21 @@ from pathlib import Path
 
 import torch
 
+from slime.rollout.scalerl import (
+    APF_METADATA_KEY,
+    APF_STEP_PASS_RATES_KEY,
+    PROMPT_ID_METADATA_KEY,
+    get_scalerl_prompt_id,
+)
 from slime.utils.data import Dataset
 from slime.utils.misc import load_function
 from slime.utils.processing_utils import load_processor, load_tokenizer
+from slime.utils.scalerl_utils import should_discard_prompt, update_step_pass_rate_window
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
+
+APF_SKIP_DRAW_COUNT_KEY = "skip_prompt_draw_count"
 
 
 class DataSource(abc.ABC):
@@ -218,6 +227,130 @@ class RolloutDataSourceWithBuffer(RolloutDataSource):
 
     def get_buffer_length(self):
         return len(self.buffer)
+
+
+class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
+    def __init__(self, args):
+        super().__init__(args)
+        self._assign_prompt_ids()
+
+    def _assign_prompt_ids(self) -> None:
+        if self.dataset is None:
+            return
+
+        for prompt_id, sample in enumerate(self.dataset.origin_samples):
+            metadata = dict(sample.metadata) if isinstance(sample.metadata, dict) else {}
+            metadata[PROMPT_ID_METADATA_KEY] = prompt_id
+            sample.metadata = metadata
+
+    def _adaptive_prompt_filter_enabled(self) -> bool:
+        return (
+            getattr(self.args, "adaptive_prompt_filter_threshold", None) is not None
+            and getattr(self.args, "adaptive_prompt_filter_window_steps", None) is not None
+        )
+
+    def _get_apf_state(self) -> dict[str, dict[int, list[float]]]:
+        state = self.metadata.setdefault(APF_METADATA_KEY, {})
+        state.setdefault(APF_STEP_PASS_RATES_KEY, {})
+        state.setdefault(APF_SKIP_DRAW_COUNT_KEY, 0)
+        return state
+
+    def get_prompt_step_pass_rates(self, prompt_id: int) -> list[float]:
+        state = self._get_apf_state()
+        prompt_step_pass_rates = state[APF_STEP_PASS_RATES_KEY]
+        return list(prompt_step_pass_rates.get(prompt_id, []))
+
+    def is_prompt_retired(self, prompt_id: int) -> bool:
+        if not self._adaptive_prompt_filter_enabled():
+            return False
+
+        return should_discard_prompt(
+            self.get_prompt_step_pass_rates(prompt_id),
+            threshold=self.args.adaptive_prompt_filter_threshold,
+            window_steps=self.args.adaptive_prompt_filter_window_steps,
+        )
+
+    def record_step_pass_rates(self, prompt_step_pass_rates: dict[int, float]) -> dict[str, float]:
+        state = self._get_apf_state()
+        if not self._adaptive_prompt_filter_enabled():
+            metrics = {"skip_prompt_draw_count": float(state.get(APF_SKIP_DRAW_COUNT_KEY, 0))}
+            state[APF_SKIP_DRAW_COUNT_KEY] = 0
+            return metrics
+
+        windows = state[APF_STEP_PASS_RATES_KEY]
+        previous_retired = {prompt_id for prompt_id in windows if self.is_prompt_retired(prompt_id)}
+        for prompt_id, step_pass_rate in prompt_step_pass_rates.items():
+            current_window = windows.get(prompt_id, [])
+            windows[prompt_id] = update_step_pass_rate_window(
+                current_window,
+                step_pass_rate,
+                window_steps=self.args.adaptive_prompt_filter_window_steps,
+            )
+
+        retired_prompt_ids = {prompt_id for prompt_id in windows if self.is_prompt_retired(prompt_id)}
+        total_prompt_count = len(self.dataset.origin_samples) if self.dataset is not None else 0
+        skipped_prompt_draw_count = float(state.get(APF_SKIP_DRAW_COUNT_KEY, 0))
+        state[APF_SKIP_DRAW_COUNT_KEY] = 0
+
+        return {
+            "retired_prompt_frac": (len(retired_prompt_ids) / total_prompt_count) if total_prompt_count > 0 else 0.0,
+            "newly_retired_prompt_count": float(len(retired_prompt_ids - previous_retired)),
+            "skip_prompt_draw_count": skipped_prompt_draw_count,
+        }
+
+    def _has_eligible_fresh_prompts(self) -> bool:
+        if self.dataset is None or not self._adaptive_prompt_filter_enabled():
+            return True
+        return any(not self.is_prompt_retired(get_scalerl_prompt_id(sample)) for sample in self.dataset.origin_samples)
+
+    def _advance_dataset_cursor(self) -> Sample:
+        assert self.dataset is not None
+        sample = self.dataset.samples[self.sample_offset]
+        self.sample_offset += 1
+        if self.sample_offset >= len(self.dataset):
+            self.sample_offset = 0
+            self.epoch_id += 1
+            if self.args.rollout_shuffle:
+                self.dataset.shuffle(self.epoch_id)
+        return sample
+
+    def _get_next_fresh_prompt_sample(self) -> Sample:
+        if self.dataset is None:
+            return Sample()
+
+        if not self._has_eligible_fresh_prompts():
+            raise RuntimeError("No eligible fresh prompts remain after adaptive prompt filtering.")
+
+        while True:
+            prompt_sample = self._advance_dataset_cursor()
+            if not self.is_prompt_retired(get_scalerl_prompt_id(prompt_sample)):
+                return prompt_sample
+            state = self._get_apf_state()
+            state[APF_SKIP_DRAW_COUNT_KEY] = int(state.get(APF_SKIP_DRAW_COUNT_KEY, 0)) + 1
+
+    def _build_groups_from_prompt_samples(self, prompt_samples) -> list[list[Sample]]:
+        groups = []
+        for prompt_sample in prompt_samples:
+            group = []
+            for _ in range(self.args.n_samples_per_prompt):
+                sample = copy.deepcopy(prompt_sample)
+                sample.group_index = self.sample_group_index
+                sample.index = self.sample_index
+                self.sample_index += 1
+                group.append(sample)
+            self.sample_group_index += 1
+            groups.append(group)
+        return groups
+
+    def get_samples(self, num_samples: int) -> list[list[Sample]]:
+        samples = self._get_samples_from_buffer(num_samples)
+        num_samples -= len(samples)
+        if num_samples == 0:
+            return samples
+
+        prompt_samples = [self._get_next_fresh_prompt_sample() for _ in range(num_samples)]
+        samples += self._build_groups_from_prompt_samples(prompt_samples)
+        return samples
 
 
 def pop_first(args, rollout_id, buffer: list[list[Sample]], num_samples: int) -> list[list[Sample]]:

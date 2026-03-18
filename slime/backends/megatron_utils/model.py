@@ -351,7 +351,8 @@ def train_one_step(
         Returns:
             tuple[torch.Tensor, Callable[[torch.Tensor], tuple[torch.Tensor, int, dict[str, torch.Tensor | list[str]]]]]:
             Output tensor(s) and the loss function, which returns
-            (loss, num_elems, {"keys": list[str], "values": torch.Tensor}).
+            (loss, num_elems, {"keys": list[str], "values": torch.Tensor,
+            "counts": torch.Tensor}).
         """
 
         # Get the batch.
@@ -467,19 +468,29 @@ def train_one_step(
         # Average loss across microbatches.
         keys = losses_reduced[0]["keys"]
         values = None
+        counts = None
         for x in losses_reduced:
             if values is None:
                 values = x["values"]
             else:
                 values += x["values"]
-        assert len(keys) + 1 == values.numel()
+            if "counts" in x:
+                if counts is None:
+                    counts = x["counts"]
+                else:
+                    counts += x["counts"]
+        assert len(keys) == values.numel()
         torch.distributed.all_reduce(values, group=mpu.get_data_parallel_group(with_context_parallel=True))
+        if counts is not None:
+            torch.distributed.all_reduce(counts, group=mpu.get_data_parallel_group(with_context_parallel=True))
 
         loss_reduced = {}
         values = values.tolist()
-        num_samples_or_tokens = values[0]
-        for key, value in zip(keys, values[1:], strict=False):
-            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / num_samples_or_tokens
+        if counts is None:
+            raise ValueError("Expected per-metric logging counts from loss_function, but none were provided.")
+        counts = counts.tolist()
+        for key, value, count in zip(keys, values, counts, strict=False):
+            loss_reduced[key] = value * mpu.get_context_parallel_world_size() / count
         return loss_reduced, grad_norm
     return {}, grad_norm
 

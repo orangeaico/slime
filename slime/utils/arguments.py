@@ -364,6 +364,31 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--length-penalty-type",
+                type=str,
+                choices=["none", "dapo_style"],
+                default="none",
+                help="Optional reward shaping for rollout reward processing.",
+            )
+            parser.add_argument(
+                "--length-penalty-cache-len",
+                type=int,
+                default=None,
+                help="Tolerance interval length used by dapo_style reward shaping.",
+            )
+            parser.add_argument(
+                "--adaptive-prompt-filter-threshold",
+                type=float,
+                default=None,
+                help="Discard prompts once every step pass rate in the APF window is at least this threshold.",
+            )
+            parser.add_argument(
+                "--adaptive-prompt-filter-window-steps",
+                type=int,
+                default=None,
+                help="Number of rollout steps tracked per prompt for adaptive prompt filtering.",
+            )
 
             # partial rollout
             parser.add_argument(

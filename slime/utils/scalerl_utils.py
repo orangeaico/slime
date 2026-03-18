@@ -76,7 +76,151 @@ def should_force_per_token_loss(loss_type: str, prompt_level_loss_aggregation: b
     return loss_type in {"cispo_loss", "dispo_loss"} and not prompt_level_loss_aggregation
 
 
+def compute_dapo_style_length_penalty(
+    response_length: int,
+    *,
+    max_response_len: int,
+    cache_len: int,
+) -> float:
+    if cache_len <= 0:
+        raise ValueError("cache_len must be positive for dapo_style length penalty.")
+
+    penalty = (max_response_len - response_length) / cache_len - 1.0
+    return float(max(-1.0, min(0.0, penalty)))
+
+
+def apply_length_penalty(
+    raw_reward: float,
+    response_length: int,
+    *,
+    length_penalty_type: str,
+    max_response_len: int,
+    cache_len: int | None,
+) -> float:
+    if length_penalty_type != "dapo_style":
+        return float(raw_reward)
+
+    if cache_len is None:
+        raise ValueError("cache_len must be provided when dapo_style length penalty is enabled.")
+
+    if raw_reward != 1.0:
+        return float(raw_reward)
+
+    return float(
+        raw_reward
+        + compute_dapo_style_length_penalty(
+            response_length,
+            max_response_len=max_response_len,
+            cache_len=cache_len,
+        )
+    )
+
+
+def update_step_pass_rate_window(
+    window: Sequence[float],
+    step_pass_rate: float,
+    *,
+    window_steps: int,
+) -> list[float]:
+    if window_steps <= 0:
+        raise ValueError("window_steps must be positive.")
+
+    updated_window = [*window, float(step_pass_rate)]
+    if len(updated_window) > window_steps:
+        updated_window = updated_window[-window_steps:]
+    return updated_window
+
+
+def should_discard_prompt(
+    step_pass_rates: Sequence[float],
+    *,
+    threshold: float,
+    window_steps: int,
+) -> bool:
+    if window_steps <= 0:
+        raise ValueError("window_steps must be positive.")
+
+    return len(step_pass_rates) == window_steps and all(rate >= threshold for rate in step_pass_rates)
+
+
+def normalize_rewards_for_training(
+    args,
+    raw_rewards: Sequence[float],
+    group_indices: Sequence[int],
+) -> list[float]:
+    if (
+        args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+        and args.rewards_normalization
+    ):
+        centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices)
+
+        if args.batch_level_normalization:
+            return get_batch_normalized_prompt_rewards(raw_rewards, group_indices)
+
+        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+            normalized_rewards = centered_rewards.clone()
+            grouped_indices: dict[int, list[int]] = {}
+            for sample_idx, group_index in enumerate(group_indices):
+                grouped_indices.setdefault(group_index, []).append(sample_idx)
+            for group_sample_indices in grouped_indices.values():
+                group_rewards = centered_rewards[group_sample_indices]
+                group_std = group_rewards.std()
+                normalized_rewards[group_sample_indices] = group_rewards / (group_std + 1e-6)
+            return normalized_rewards.tolist()
+
+        return centered_rewards.tolist()
+
+    return list(raw_rewards)
+
+
+def get_train_metric_normalizers(
+    keys: Sequence[str],
+    *,
+    num_samples: int,
+    num_tokens: int,
+    num_prompt_groups: int,
+    prompt_level_loss_aggregation: bool,
+    calculate_per_token_loss: bool,
+) -> list[int]:
+    """Return per-metric denominators for Megatron train logging.
+
+    Most train metrics are reduced as a sum of per-sample means and should
+    therefore be normalized by the number of samples. When prompt-level loss
+    aggregation is enabled, only the prompt-aggregated objectives (`loss` and
+    `pg_loss`) should switch to prompt-group normalization; auxiliary metrics
+    like `ratio` and `ppo_kl` remain sample-based.
+    """
+    if calculate_per_token_loss and not prompt_level_loss_aggregation:
+        return [num_tokens] * len(keys)
+
+    if not prompt_level_loss_aggregation:
+        return [num_samples] * len(keys)
+
+    prompt_aggregated_keys = {"loss", "pg_loss"}
+    return [num_prompt_groups if key in prompt_aggregated_keys else num_samples for key in keys]
+
+
 def validate_scalerl_args(args) -> None:
+    length_penalty_type = getattr(args, "length_penalty_type", "none")
+    length_penalty_cache_len = getattr(args, "length_penalty_cache_len", None)
+    apf_threshold = getattr(args, "adaptive_prompt_filter_threshold", None)
+    apf_window_steps = getattr(args, "adaptive_prompt_filter_window_steps", None)
+
+    if length_penalty_type == "dapo_style":
+        if length_penalty_cache_len is None or length_penalty_cache_len <= 0:
+            raise ValueError("--length-penalty-cache-len must be positive when --length-penalty-type dapo_style.")
+    elif length_penalty_cache_len is not None and length_penalty_cache_len <= 0:
+        raise ValueError("--length-penalty-cache-len must be positive when provided.")
+
+    if (apf_threshold is None) != (apf_window_steps is None):
+        raise ValueError(
+            "--adaptive-prompt-filter-threshold and --adaptive-prompt-filter-window-steps must be set together."
+        )
+    if apf_threshold is not None and not (0.0 <= apf_threshold <= 1.0):
+        raise ValueError("--adaptive-prompt-filter-threshold must be between 0 and 1.")
+    if apf_window_steps is not None and apf_window_steps <= 0:
+        raise ValueError("--adaptive-prompt-filter-window-steps must be positive.")
+
     if args.batch_level_normalization:
         if args.advantage_estimator not in ["grpo", "gspo"]:
             raise ValueError("--batch-level-normalization is supported only for --advantage-estimator grpo or gspo.")

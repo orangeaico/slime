@@ -26,6 +26,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_baseline_advantages,
     get_reinforce_plus_plus_returns,
 )
+from slime.utils.scalerl_utils import get_train_metric_normalizers
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -1018,8 +1019,9 @@ def loss_function(
         - `scaled_loss` is the loss tensor (scalar) rescaled for Megatron.
         - `normalizer` is `num_tokens` (scalar tensor) if
           `args.calculate_per_token_loss` is True, else `1` (int).
-        - `logging_dict` has keys "keys" (list of str metric names) and
-          "values" (1D tensor: [count, metric1, metric2, ...]).
+        - `logging_dict` has keys "keys" (list of str metric names),
+          "values" (1D tensor of metric numerators), and "counts"
+          (1D tensor of per-metric denominators).
     """
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
     num_samples = len(batch["response_lengths"])
@@ -1075,13 +1077,16 @@ def loss_function(
         ),
         {
             "keys": list(log.keys()),
-            "values": torch.tensor(
-                [
-                    num_prompt_groups
-                    if args.prompt_level_loss_aggregation
-                    else (num_samples if not args.calculate_per_token_loss else num_tokens),
-                ]
-                + list(log.values()),
+            "values": torch.tensor(list(log.values()), device=logits.device),
+            "counts": torch.tensor(
+                get_train_metric_normalizers(
+                    list(log.keys()),
+                    num_samples=num_samples,
+                    num_tokens=int(num_tokens.item() if isinstance(num_tokens, torch.Tensor) else num_tokens),
+                    num_prompt_groups=num_prompt_groups,
+                    prompt_level_loss_aggregation=args.prompt_level_loss_aggregation,
+                    calculate_per_token_loss=args.calculate_per_token_loss,
+                ),
                 device=logits.device,
             ),
         },

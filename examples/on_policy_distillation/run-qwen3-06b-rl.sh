@@ -29,6 +29,10 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 source "/root/slime/scripts/models/qwen3-0.6B.sh"
 
 MAX_SEQ_LEN=1024
+APF_THRESHOLD=${APF_THRESHOLD:-0.9}
+APF_WINDOW_STEPS=${APF_WINDOW_STEPS:-1}
+LENGTH_PENALTY_TYPE=${LENGTH_PENALTY_TYPE:-dapo_style}
+LENGTH_PENALTY_CACHE_LEN=${LENGTH_PENALTY_CACHE_LEN:-$(((MAX_SEQ_LEN + 6) / 7))}
 
 LOSS_TYPE=${LOSS_TYPE:-policy_loss}
 CISPO_EPS_CLIP_HIGH=${CISPO_EPS_CLIP_HIGH:-5.0}
@@ -72,6 +76,7 @@ CKPT_ARGS=(
 )
 
 ROLLOUT_ARGS=(
+--data-source-path slime.rollout.data_source.ScaleRLRolloutDataSourceWithBuffer
    --prompt-data /root/data/datasets/gsm8k/train.jsonl
    --input-key prompt
    --label-key label
@@ -88,6 +93,10 @@ ROLLOUT_ARGS=(
    --over-sampling-batch-size 48
    --n-samples-per-prompt 8
    --rollout-max-response-len $MAX_SEQ_LEN
+   --adaptive-prompt-filter-threshold $APF_THRESHOLD
+   --adaptive-prompt-filter-window-steps $APF_WINDOW_STEPS
+   --length-penalty-type $LENGTH_PENALTY_TYPE
+   --length-penalty-cache-len $LENGTH_PENALTY_CACHE_LEN
 
    --rollout-temperature 0.7
    --rollout-top-p 0.8
@@ -99,7 +108,9 @@ ROLLOUT_ARGS=(
 )
 
 RM_ARGS=(
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std_with_dapo_style
+   --custom-reward-post-process-path slime.rollout.scalerl.post_process_rewards_with_dapo_style
+   --rollout-all-samples-process-path slime.rollout.scalerl.update_step_window_adaptive_prompt_filter
 )
 
 EVAL_ARGS=(   
