@@ -26,10 +26,11 @@ else
 fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
-source "/root/slime/scripts/models/qwen3-0.6B.sh"
+source "/root/repo/slime/.env"
+source "/root/repo/slime/scripts/models/qwen3-0.6B.sh"
 
 MAX_SEQ_LEN=1024
-APF_THRESHOLD=${APF_THRESHOLD:-0.9}
+APF_THRESHOLD=${APF_THRESHOLD:-0.875}
 APF_WINDOW_STEPS=${APF_WINDOW_STEPS:-1}
 LENGTH_PENALTY_TYPE=${LENGTH_PENALTY_TYPE:-dapo_style}
 LENGTH_PENALTY_CACHE_LEN=${LENGTH_PENALTY_CACHE_LEN:-$(((MAX_SEQ_LEN + 6) / 7))}
@@ -64,19 +65,19 @@ else
 fi
    
 CKPT_ARGS=(
-   --hf-checkpoint /root/data/hf_models/Qwen3-0.6B_rl_grpo_non_think_7473_4_steps
-   --ref-load /root/data/mega-models/Qwen3-0.6B_rl_grpo_non_think_7473_4_steps
+   --hf-checkpoint /root/data/hf_models/Qwen3-0.6B
+   --ref-load /root/data/mega-models/Qwen3-0.6B
    # --load /root/data/mega-models/Qwen3-0.6B_slime/
    # --no-load-rng
    # --no-load-optim
-   --save /root/data/mega-models/Qwen3-0.6B_rl_cispo_non_think_7473
+   --save /root/data/mega-models/Qwen3-0.6B_rl_grpo_7473
    --no-save-optim
    --no-save-rng
    --save-interval 117
 )
 
 ROLLOUT_ARGS=(
---data-source-path slime.rollout.data_source.ScaleRLRolloutDataSourceWithBuffer
+   --data-source-path slime.rollout.data_source.ScaleRLRolloutDataSourceWithBuffer
    --prompt-data /root/data/datasets/gsm8k/train.jsonl
    --input-key prompt
    --label-key label
@@ -147,8 +148,8 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    ${LOSS_ARGS[@]}
-   # --batch-level-normalization
-   # --prompt-level-loss-aggregation
+   --batch-level-normalization
+   --prompt-level-loss-aggregation
    --kl-loss-coef 0.00
    --kl-loss-type low_var_kl
    --kl-coef 0.00
@@ -179,7 +180,7 @@ SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 2
    --sglang-mem-fraction-static 0.8
    --partial-rollout
-   # --sglang-enable-fp32-lm-head
+   --sglang-enable-fp32-lm-head
 )
 
 
@@ -189,7 +190,7 @@ MISC_ARGS=(
    --attention-backend flash
    --cross-entropy-loss-fusion
    --cross-entropy-fusion-impl te
-# --fp32-lm-head
+   --fp32-lm-head
    --bf16
    --use-distributed-optimizer
    --use-precision-aware-optimizer
