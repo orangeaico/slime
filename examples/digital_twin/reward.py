@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import json
 import re
+import logging
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
+
+logger = logging.getLogger(__name__)
 
 
 SPEC_PATH = Path(__file__).with_name("reward_spec.json")
@@ -127,60 +131,113 @@ def _is_in_range(value: Any, min_value: float, max_value: float) -> bool:
 
 
 def _validate_matrix_response(response: Any, question: dict[str, Any]) -> bool:
+    """Matrix questions must have SelectedByPosition and SelectedText as arrays of equal length."""
     if not isinstance(response, dict):
+        logger.warning("Matrix validation failed - Expected: dict with SelectedByPosition and SelectedText fields, Got: %s", type(response))
         return False
     if "SelectedByPosition" not in response or "SelectedText" not in response:
+        logger.warning("Matrix validation failed - Expected: dict with SelectedByPosition and SelectedText fields, Got: dict with fields %s", list(response.keys()))
         return False
-    if len(response["SelectedByPosition"]) != len(response["SelectedText"]):
+
+    # Ground truth validation: Both must be lists (arrays)
+    sel_pos = response["SelectedByPosition"]
+    sel_text = response["SelectedText"]
+
+    if not isinstance(sel_pos, list) or not isinstance(sel_text, list):
+        logger.warning("Matrix validation failed - Expected: arrays for both SelectedByPosition and SelectedText, Got: SelectedByPosition type %s, SelectedText type %s",
+                      type(sel_pos).__name__, type(sel_text).__name__)
         return False
-    if not all(isinstance(pos, (int, str)) for pos in response["SelectedByPosition"]):
+
+    if len(sel_pos) != len(sel_text):
+        logger.warning("Matrix validation failed - Expected: equal length arrays, Got: SelectedByPosition length %d, SelectedText length %d",
+                      len(sel_pos), len(sel_text))
         return False
-    if not all(isinstance(text, str) for text in response["SelectedText"]):
+
+    if len(sel_pos) == 0:  # Empty arrays not valid
+        logger.warning("Matrix validation failed - Expected: non-empty arrays, Got: empty arrays")
+        return False
+
+    if not all(isinstance(pos, (int, str)) for pos in sel_pos):
+        logger.warning("Matrix validation failed - Expected: SelectedByPosition array with int/str elements, Got: array with types %s",
+                      [type(pos).__name__ for pos in sel_pos])
+        return False
+    if not all(isinstance(text, str) for text in sel_text):
+        logger.warning("Matrix validation failed - Expected: SelectedText array with string elements, Got: array with types %s",
+                      [type(text).__name__ for text in sel_text])
         return False
     return True
 
 
 def _validate_single_choice_response(response: Any, question: dict[str, Any]) -> bool:
+    """MC (Single Choice) questions must have SelectedByPosition and SelectedText as single values."""
     if not isinstance(response, dict):
+        logger.warning("MC validation failed - Expected: dict with SelectedByPosition and SelectedText fields, Got: %s", type(response))
         return False
     if "SelectedByPosition" not in response or "SelectedText" not in response:
+        logger.warning("MC validation failed - Expected: dict with SelectedByPosition and SelectedText fields, Got: dict with fields %s", list(response.keys()))
         return False
-    if not isinstance(response["SelectedByPosition"], (int, str)):
+
+    # Ground truth validation: Both must be single values (not lists)
+    sel_pos = response["SelectedByPosition"]
+    sel_text = response["SelectedText"]
+
+    if isinstance(sel_pos, list) or isinstance(sel_text, list):
+        logger.warning("MC validation failed - Expected: single values for SelectedByPosition and SelectedText, Got: SelectedByPosition is_array=%s, SelectedText is_array=%s",
+                      isinstance(sel_pos, list), isinstance(sel_text, list))
+        return False  # Arrays are invalid for single choice
+
+    if not isinstance(sel_pos, (int, str)):
+        logger.warning("MC validation failed - Expected: SelectedByPosition as int or string, Got: %s", type(sel_pos).__name__)
         return False
-    if isinstance(response["SelectedByPosition"], str):
+    if isinstance(sel_pos, str):
         try:
-            int(response["SelectedByPosition"])
+            int(sel_pos)
         except ValueError:
+            logger.warning("MC validation failed - Expected: SelectedByPosition as numeric string, Got: non-numeric string '%s'", sel_pos)
             return False
-    if not isinstance(response["SelectedText"], str):
+    if not isinstance(sel_text, str):
+        logger.warning("MC validation failed - Expected: SelectedText as string, Got: %s", type(sel_text).__name__)
         return False
     return True
 
 
 def _validate_slider_response(response: Any, question: dict[str, Any]) -> bool:
+    """Slider questions must have Values as an array."""
     if not isinstance(response, dict):
         return False
     if "Values" not in response:
         return False
-    if not isinstance(response["Values"], list):
+
+    # Ground truth validation: Values must be a list/array
+    values = response["Values"]
+    if not isinstance(values, list):
         return False
-    if not all(_is_valid_number(value) for value in response["Values"]):
+
+    if len(values) == 0:  # Empty arrays not valid
+        return False
+
+    if not all(_is_valid_number(value) for value in values):
         return False
 
     constraints = question.get("NumericConstraints", {})
     if "MinValue" in constraints and "MaxValue" in constraints:
-        if not all(_is_in_range(value, constraints["MinValue"], constraints["MaxValue"]) for value in response["Values"]):
+        if not all(_is_in_range(value, constraints["MinValue"], constraints["MaxValue"]) for value in values):
             return False
     return True
 
 
 def _validate_text_entry_response(response: Any, question: dict[str, Any]) -> bool:
+    """Text Entry (TE) questions must have Text as a string."""
     if not isinstance(response, dict):
         return False
     if "Text" not in response:
         return False
-    if not isinstance(response["Text"], str):
+
+    # Ground truth validation: Text must be a string (not array)
+    text = response["Text"]
+    if not isinstance(text, str):
         return False
+
     return True
 
 
@@ -194,11 +251,14 @@ def _validate_response(predicted_question: Any, question: dict[str, Any]) -> boo
     if not question_type or not answers:
         return False
 
+    # Map both current names and ground truth question type names
     validators = {
         "Matrix": _validate_matrix_response,
         "Single Choice": _validate_single_choice_response,
+        "MC": _validate_single_choice_response,  # Ground truth name for Multiple Choice
         "Slider": _validate_slider_response,
         "Text Entry": _validate_text_entry_response,
+        "TE": _validate_text_entry_response,  # Ground truth name for Text Entry
     }
     validation_func = validators.get(question_type)
     if validation_func is None:
@@ -222,6 +282,26 @@ def _get_item_ids_and_text(question: dict[str, Any]) -> tuple[list[str], list[st
 
 
 def _extract_numeric_input_columns(question: dict[str, Any], answer_override: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Extract numeric input columns with crash-proof error handling.
+
+    Returns empty dict {} for any format errors to prevent training crashes.
+    Format validation is handled separately in _validate_response().
+    """
+    try:
+        return _extract_numeric_input_columns_impl(question, answer_override)
+    except Exception as e:
+        # Log error details for debugging but don't crash training
+        qid = str(question.get("QuestionID", "unknown")).upper()
+        question_type = question.get("QuestionType", "unknown")
+        answer_data = answer_override if answer_override is not None else question.get("Answers", {})
+
+        logger.warning("Extraction failed for question %s (%s) - Expected: valid answer format, Got error: %s, Answer data: %s",
+                      qid, question_type, e, answer_data)
+
+        return {}  # Return empty dict to exclude this question from scoring
+
+
+def _extract_numeric_input_columns_impl(question: dict[str, Any], answer_override: dict[str, Any] | None = None) -> dict[str, Any]:
     qid = str(question.get("QuestionID", "")).upper()
     if not qid:
         return {}
@@ -256,6 +336,12 @@ def _extract_numeric_input_columns(question: dict[str, Any], answer_override: di
         item_ids, _item_text = _get_item_ids_and_text(question)
         selected = answer_data.get("SelectedByPosition", [])
         selected_text = answer_data.get("SelectedText", [])
+
+        # Defensive checks: Ensure selected and selected_text are lists
+        if not isinstance(selected, list):
+            selected = []  # Convert to empty list if not a list
+        if not isinstance(selected_text, list):
+            selected_text = []  # Convert to empty list if not a list
 
         for index, item_id in enumerate(item_ids):
             key = f"{qid}_{item_id.upper()}"
