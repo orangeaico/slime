@@ -29,13 +29,16 @@ echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 source "/root/repo/slime/.env"
 source "/root/repo/slime/scripts/models/qwen3-0.6B.sh"
 
+TIMESTAMP=$(date +"%Y_%m_%d_%H_%M_%S")
+MODEL_NAME=Qwen3-0.6B
+
 MAX_SEQ_LEN=1024
 APF_THRESHOLD=${APF_THRESHOLD:-0.875}
 APF_WINDOW_STEPS=${APF_WINDOW_STEPS:-1}
 LENGTH_PENALTY_TYPE=${LENGTH_PENALTY_TYPE:-dapo_style}
 LENGTH_PENALTY_CACHE_LEN=${LENGTH_PENALTY_CACHE_LEN:-$(((MAX_SEQ_LEN + 6) / 7))}
 
-LOSS_TYPE=${LOSS_TYPE:-policy_loss}
+LOSS_TYPE=${LOSS_TYPE:-cispo_loss}
 CISPO_EPS_CLIP_HIGH=${CISPO_EPS_CLIP_HIGH:-5.0}
 DISPO_POS_EPS_CLIP_LOW=${DISPO_POS_EPS_CLIP_LOW:-0.2}
 DISPO_POS_EPS_CLIP_HIGH=${DISPO_POS_EPS_CLIP_HIGH:-10}
@@ -65,12 +68,12 @@ else
 fi
    
 CKPT_ARGS=(
-   --hf-checkpoint /root/data/hf_models/Qwen3-0.6B
-   --ref-load /root/data/mega-models/Qwen3-0.6B
+   --hf-checkpoint /root/data/hf_models/$MODEL_NAME
+   --ref-load /root/data/mega-models/$MODEL_NAME
    # --load /root/data/mega-models/Qwen3-0.6B_slime/
    # --no-load-rng
    # --no-load-optim
-   --save /root/data/mega-models/Qwen3-0.6B_rl_grpo_7473
+   --save /root/data/trained-mega-models/$TIMESTAMP/$MODEL_NAME/checkpoints
    --no-save-optim
    --no-save-rng
    --save-interval 117
@@ -88,7 +91,7 @@ ROLLOUT_ARGS=(
    --rm-type dapo
    --reward-key score
 
-   --num-rollout 936
+   --num-rollout 702
    --rollout-batch-size 32
    --num-steps-per-rollout 4
    --over-sampling-batch-size 48
