@@ -51,6 +51,7 @@ def _make_args(tmp_path, **overrides):
         buffer_filter_path=None,
         adaptive_prompt_filter_threshold=0.9,
         adaptive_prompt_filter_window_steps=2,
+        adaptive_prompt_filter_drop_prob=1.0,
         reward_key="score",
         length_penalty_type="dapo_style",
         length_penalty_cache_len=2,
@@ -108,6 +109,7 @@ def test_custom_data_source_assigns_prompt_ids_and_skips_retired_prompts(tmp_pat
     assert sampled_prompt_id != 0
     skipped_metrics = data_source.record_step_pass_rates({})
     assert skipped_metrics["skip_prompt_draw_count"] == pytest.approx(1.0)
+    assert skipped_metrics["kept_retired_prompt_draw_count"] == pytest.approx(0.0)
 
 
 def test_custom_data_source_raises_when_no_eligible_prompts_remain(tmp_path, patched_dataset):
@@ -121,6 +123,69 @@ def test_custom_data_source_raises_when_no_eligible_prompts_remain(tmp_path, pat
 
     with pytest.raises(RuntimeError, match="No eligible fresh prompts remain"):
         data_source.get_samples(1)
+
+
+def test_probabilistic_apf_drop_can_keep_or_skip_retired_prompts(tmp_path, patched_dataset):
+    args = _make_args(tmp_path, adaptive_prompt_filter_drop_prob=0.5)
+    data_source = ScaleRLRolloutDataSourceWithBuffer(args)
+    data_source.record_step_pass_rates({0: 1.0})
+    data_source.record_step_pass_rates({0: 1.0})
+
+    class FakeRandom:
+        def __init__(self, values):
+            self.values = list(values)
+
+        def random(self):
+            return self.values.pop(0)
+
+        def getstate(self):
+            return tuple(self.values)
+
+        def setstate(self, state):
+            self.values = list(state)
+
+    data_source._apf_random = FakeRandom([0.6, 0.2])
+    data_source._store_apf_rng_state()
+
+    groups = data_source.get_samples(1)
+    assert groups[0][0].metadata[PROMPT_ID_METADATA_KEY] == 0
+
+    data_source.sample_offset = 0
+    groups = data_source.get_samples(1)
+    assert groups[0][0].metadata[PROMPT_ID_METADATA_KEY] == 1
+
+    skipped_metrics = data_source.record_step_pass_rates({})
+    assert skipped_metrics["skip_prompt_draw_count"] == pytest.approx(1.0)
+    assert skipped_metrics["kept_retired_prompt_draw_count"] == pytest.approx(1.0)
+
+
+def test_probabilistic_apf_avoids_false_dataset_exhaustion(tmp_path, patched_dataset):
+    args = _make_args(tmp_path, adaptive_prompt_filter_drop_prob=0.5)
+    data_source = ScaleRLRolloutDataSourceWithBuffer(args)
+
+    for prompt_id in [0, 1, 2]:
+        data_source.record_step_pass_rates({prompt_id: 1.0})
+    for prompt_id in [0, 1, 2]:
+        data_source.record_step_pass_rates({prompt_id: 1.0})
+
+    class FakeRandom:
+        def random(self):
+            return 0.9
+
+        def getstate(self):
+            return ()
+
+        def setstate(self, state):
+            return None
+
+    data_source._apf_random = FakeRandom()
+    data_source._store_apf_rng_state()
+
+    groups = data_source.get_samples(1)
+    assert len(groups) == 1
+    kept_metrics = data_source.record_step_pass_rates({})
+    assert kept_metrics["skip_prompt_draw_count"] == pytest.approx(0.0)
+    assert kept_metrics["kept_retired_prompt_draw_count"] == pytest.approx(1.0)
 
 
 def test_update_step_window_apf_aggregates_multiple_groups_per_prompt(tmp_path, patched_dataset):
@@ -151,6 +216,7 @@ def test_update_step_window_apf_aggregates_multiple_groups_per_prompt(tmp_path, 
     assert rollout_metrics["retired_prompt_frac"] == pytest.approx(0.0)
     assert rollout_metrics["newly_retired_prompt_count"] == pytest.approx(0.0)
     assert rollout_metrics["skip_prompt_draw_count"] == pytest.approx(0.0)
+    assert rollout_metrics["kept_retired_prompt_draw_count"] == pytest.approx(0.0)
 
 
 def test_apf_state_survives_save_and_load(tmp_path, patched_dataset):

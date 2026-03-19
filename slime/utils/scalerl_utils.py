@@ -205,6 +205,7 @@ def validate_scalerl_args(args) -> None:
     length_penalty_cache_len = getattr(args, "length_penalty_cache_len", None)
     apf_threshold = getattr(args, "adaptive_prompt_filter_threshold", None)
     apf_window_steps = getattr(args, "adaptive_prompt_filter_window_steps", None)
+    apf_drop_prob = getattr(args, "adaptive_prompt_filter_drop_prob", 1.0)
 
     if length_penalty_type == "dapo_style":
         if length_penalty_cache_len is None or length_penalty_cache_len <= 0:
@@ -220,6 +221,8 @@ def validate_scalerl_args(args) -> None:
         raise ValueError("--adaptive-prompt-filter-threshold must be between 0 and 1.")
     if apf_window_steps is not None and apf_window_steps <= 0:
         raise ValueError("--adaptive-prompt-filter-window-steps must be positive.")
+    if not (0.0 <= apf_drop_prob <= 1.0):
+        raise ValueError("--adaptive-prompt-filter-drop-prob must be between 0 and 1.")
 
     if args.batch_level_normalization:
         if args.advantage_estimator not in ["grpo", "gspo"]:
