@@ -35,30 +35,21 @@ DIGITAL_TWIN_DATA_DIR="${DIGITAL_TWIN_DATA_DIR:-${REPO_ROOT}/examples/digital_tw
 TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${DIGITAL_TWIN_DATA_DIR}/train_smoke.jsonl}"
 EVAL_DATA_PATH="${EVAL_DATA_PATH:-${DIGITAL_TWIN_DATA_DIR}/eval_smoke.jsonl}"
 
-DEFAULT_HF_CHECKPOINT="/home/shared/megatron_dir/hf_models/Qwen3-0.6B"
-if [[ ! -e "${DEFAULT_HF_CHECKPOINT}" ]]; then
-    DEFAULT_HF_CHECKPOINT="/root/data/hf_models/Qwen3-0.6B"
-fi
+DEFAULT_HF_CHECKPOINT="/root/data/hf_models/Qwen3-0.6B"
 
-DEFAULT_REF_LOAD="/home/shared/megatron_dir/mega-models/Qwen3-0.6B"
-if [[ ! -e "${DEFAULT_REF_LOAD}" ]]; then
-    DEFAULT_REF_LOAD="/root/data/mega-models/Qwen3-0.6B"
-fi
+DEFAULT_REF_LOAD="/root/data/mega-models/Qwen3-0.6B"
 
-DEFAULT_SAVE_DIR="/home/shared/megatron_dir/mega-models/Qwen3-0.6B_digital_twin_grpo_base_non_think"
-if [[ ! -e "/home/shared/megatron_dir/mega-models" ]]; then
-    DEFAULT_SAVE_DIR="/root/data/mega-models/Qwen3-0.6B_digital_twin_grpo_base_non_think"
-fi
+DEFAULT_SAVE_DIR="/root/data/mega-models/Qwen3-0.6B_digital_twin_grpo_base_non_think"
 
 HF_CHECKPOINT="${HF_CHECKPOINT:-${DEFAULT_HF_CHECKPOINT}}"
 REF_LOAD="${REF_LOAD:-${DEFAULT_REF_LOAD}}"
 LOAD_DIR="${LOAD_DIR:-}"
 SAVE_DIR="${SAVE_DIR:-${DEFAULT_SAVE_DIR}}"
 
-MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-65536}"
-MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-57344}"
-MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-8192}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-65536}"
+MAX_CONTEXT_LEN="${MAX_CONTEXT_LEN:-44000}"
+MAX_PROMPT_LEN="${MAX_PROMPT_LEN:-40000}"
+MAX_RESPONSE_LEN="${MAX_RESPONSE_LEN:-4000}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-22000}"
 ROPE_SCALING_FACTOR="${ROPE_SCALING_FACTOR:-2.0}"
 ORIGINAL_MAX_POSITION_EMBEDDINGS="${ORIGINAL_MAX_POSITION_EMBEDDINGS:-32768}"
 SGLANG_JSON_MODEL_OVERRIDE_ARGS="${SGLANG_JSON_MODEL_OVERRIDE_ARGS:-$(printf '{"max_position_embeddings":%s,"rope_scaling":{"rope_type":"yarn","factor":%s,"original_max_position_embeddings":%s}}' "${MAX_CONTEXT_LEN}" "${ROPE_SCALING_FACTOR}" "${ORIGINAL_MAX_POSITION_EMBEDDINGS}")}"
@@ -133,7 +124,7 @@ PERF_ARGS=(
    --tensor-model-parallel-size 1
    --sequence-parallel
    --pipeline-model-parallel-size 1
-   --context-parallel-size 1
+   --context-parallel-size 2
    --expert-model-parallel-size 1
    --expert-tensor-parallel-size 1
 
