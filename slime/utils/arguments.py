@@ -389,6 +389,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Number of rollout steps tracked per prompt for adaptive prompt filtering.",
             )
+            parser.add_argument(
+                "--adaptive-prompt-filter-drop-prob",
+                type=float,
+                default=1.0,
+                help="Probability of dropping a prompt draw once it satisfies the adaptive prompt filter condition.",
+            )
 
             # partial rollout
             parser.add_argument(

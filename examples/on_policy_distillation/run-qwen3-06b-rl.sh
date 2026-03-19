@@ -35,6 +35,7 @@ MODEL_NAME=Qwen3-0.6B
 MAX_SEQ_LEN=1024
 APF_THRESHOLD=${APF_THRESHOLD:-0.875}
 APF_WINDOW_STEPS=${APF_WINDOW_STEPS:-1}
+APF_DROP_PROB=${APF_DROP_PROB:-0.75}
 LENGTH_PENALTY_TYPE=${LENGTH_PENALTY_TYPE:-dapo_style}
 LENGTH_PENALTY_CACHE_LEN=${LENGTH_PENALTY_CACHE_LEN:-$(((MAX_SEQ_LEN + 6) / 7))}
 
@@ -99,6 +100,7 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len $MAX_SEQ_LEN
    --adaptive-prompt-filter-threshold $APF_THRESHOLD
    --adaptive-prompt-filter-window-steps $APF_WINDOW_STEPS
+   --adaptive-prompt-filter-drop-prob $APF_DROP_PROB
    --length-penalty-type $LENGTH_PENALTY_TYPE
    --length-penalty-cache-len $LENGTH_PENALTY_CACHE_LEN
 
