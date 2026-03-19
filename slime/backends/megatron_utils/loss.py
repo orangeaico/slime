@@ -1,7 +1,7 @@
 import logging
 from argparse import Namespace
 from collections.abc import Callable, Iterator
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.distributed as dist
@@ -37,6 +37,43 @@ from .cp_utils import (
     slice_log_prob_with_cp,
 )
 
+OutputKind = Literal["logits", "token_nll"]
+
+CCE_RL_LOSS_TYPES = frozenset({"policy_loss", "cispo_loss", "dispo_loss"})
+
+
+def use_cce_log_prob_fast_path(args: Namespace, *, loss_type: str | None = None) -> bool:
+    if not getattr(args, "use_linear_cross_entropy", False):
+        return False
+    if float(getattr(args, "entropy_coef", 0.0)) != 0.0:
+        return False
+    if getattr(args, "enable_mtp_training", False):
+        return False
+    if loss_type is None:
+        loss_type = getattr(args, "loss_type", None)
+    return loss_type in CCE_RL_LOSS_TYPES
+
+
+def _normalize_response_tensor(
+    logits: torch.Tensor,
+    *,
+    args: Namespace,
+    output_kind: OutputKind,
+) -> torch.Tensor:
+    if output_kind == "logits":
+        return logits
+
+    if logits.dim() == 1:
+        logits = logits.unsqueeze(0)
+    if logits.dim() == 2:
+        logits = logits.unsqueeze(-1)
+
+    assert logits.dim() == 3, f"{logits.shape}"
+    assert logits.size(-1) == 1, f"{logits.shape}"
+    if args.qkv_format == "thd":
+        assert logits.size(0) == 1, f"{logits.shape}"
+    return logits.to(torch.float32)
+
 def get_responses(
     logits: torch.Tensor,
     *,
@@ -45,6 +82,7 @@ def get_responses(
     total_lengths: list[int],
     response_lengths: list[int],
     max_seq_lens: list[int] | None = None,
+    output_kind: OutputKind = "logits",
 ) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
     """Yield response-aligned `(logits_chunk, tokens_chunk)` pairs per sample.
 
@@ -68,6 +106,7 @@ def get_responses(
         (1D int64), both aligned to response tokens for one sample.
     """
     qkv_format = args.qkv_format
+    logits = _normalize_response_tensor(logits, args=args, output_kind=output_kind)
 
     assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
@@ -79,7 +118,7 @@ def get_responses(
         assert max_seq_lens is not None
         logits = logits.view(-1, logits.size(-1))
 
-    if args.rollout_temperature != 1.0:
+    if output_kind == "logits" and args.rollout_temperature != 1.0:
         logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
@@ -238,6 +277,7 @@ def get_log_probs_and_entropy(
     with_entropy: bool = False,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
+    output_kind: OutputKind = "logits",
 ) -> dict[str, list[torch.Tensor]]:
     """Compute per-token log-probabilities (and optionally entropy) on responses.
 
@@ -262,6 +302,7 @@ def get_log_probs_and_entropy(
         a list of `[R]` tensors.
     """
     assert non_loss_data
+    logits = _normalize_response_tensor(logits, args=args, output_kind=output_kind)
     log_probs_list = []
     entropy_list = []
     for logits_chunk, tokens_chunk in get_responses(
@@ -271,7 +312,16 @@ def get_log_probs_and_entropy(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        output_kind=output_kind,
     ):
+        if output_kind == "token_nll":
+            assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
+            log_prob = -logits_chunk.squeeze(-1)
+            log_probs_list.append(log_prob)
+            if with_entropy:
+                entropy_list.append(torch.zeros_like(log_prob))
+            continue
+
         log_prob, entropy = calculate_log_probs_and_entropy(
             logits_chunk,
             tokens_chunk,
@@ -313,6 +363,7 @@ def get_values(
     with_entropy: bool = False,
     non_loss_data: bool = True,
     max_seq_lens: list[int] | None = None,
+    output_kind: OutputKind = "logits",
 ) -> dict[str, list[torch.Tensor]]:
     """Extract per-token value predictions over response tokens.
 
@@ -341,6 +392,7 @@ def get_values(
         total_lengths=total_lengths,
         response_lengths=response_lengths,
         max_seq_lens=max_seq_lens,
+        output_kind=output_kind,
     ):
         assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
         value_list.append(logits_chunk.squeeze(-1))
@@ -629,6 +681,7 @@ def policy_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    output_kind: OutputKind = "logits",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute policy loss (PPO/GSPO/CISPO/DISPO) and metrics.
 
@@ -660,6 +713,7 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
     max_seq_lens = batch.get("max_seq_lens", None)
+    with_entropy = output_kind == "logits"
 
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
@@ -667,8 +721,9 @@ def policy_loss_function(
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=with_entropy,
         max_seq_lens=max_seq_lens,
+        output_kind=output_kind,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -818,9 +873,12 @@ def policy_loss_function(
     ratio_mean = sum_of_sample_mean(ratio)
 
     # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    if with_entropy:
+        entropy = log_probs_and_entropy["entropy"]
+        entropy = torch.cat(entropy, dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+    else:
+        entropy_loss = log_probs.new_zeros(())
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 
@@ -889,6 +947,7 @@ def value_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    output_kind: OutputKind = "logits",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute clipped value loss and metrics.
 
@@ -947,6 +1006,7 @@ def sft_loss_function(
     batch: RolloutBatch,
     logits: torch.Tensor,
     sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+    output_kind: OutputKind = "logits",
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute supervised fine-tuning loss over response tokens.
 
@@ -998,6 +1058,7 @@ def loss_function(
     batch: RolloutBatch,
     num_microbatches: int,
     logits: torch.Tensor,
+    output_kind: OutputKind = "logits",
 ) -> tuple[torch.Tensor, int | torch.Tensor, dict[str, list[str] | torch.Tensor]]:
     """Dispatch to the configured loss and rescale for Megatron integration.
 
@@ -1053,10 +1114,15 @@ def loss_function(
         case _:
             raise ValueError(f"Unknown loss type: {args.loss_type}")
 
-    if args.recompute_loss_function:
-        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean)
+    if args.loss_type == "custom_loss":
+        if args.recompute_loss_function:
+            loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean)
+        else:
+            loss, log = func(args, batch, logits, sum_of_sample_mean)
+    elif args.recompute_loss_function:
+        loss, log = checkpoint(func, args, batch, logits, sum_of_sample_mean, output_kind)
     else:
-        loss, log = func(args, batch, logits, sum_of_sample_mean)
+        loss, log = func(args, batch, logits, sum_of_sample_mean, output_kind)
 
     # Here we need to divide by cp_size because to cancel the multiply in Megatron.
     if args.prompt_level_loss_aggregation:

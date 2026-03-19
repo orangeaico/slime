@@ -190,6 +190,7 @@ MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --attention-backend flash
+# --fused-linear-cross-entropy
    --cross-entropy-loss-fusion
    --cross-entropy-fusion-impl te
    --fp32-lm-head

@@ -27,10 +27,18 @@ from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
 from .data import DataIterator, get_batch
-from .loss import loss_function
+from .loss import get_log_probs_and_entropy, loss_function, use_cce_log_prob_fast_path
 from .model_provider import get_model_provider_func, wrap_model_provider_with_freeze
 
 logger = logging.getLogger(__name__)
+
+
+def _get_cce_forward_kwargs(args: Namespace, cce_labels: torch.Tensor) -> dict[str, object]:
+    return {
+        "labels": cce_labels,
+        "cce_temperature": args.rollout_temperature,
+        "cce_shift": False,
+    }
 
 
 def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer) -> OptimizerParamScheduler:
@@ -224,14 +232,25 @@ def forward_only(
         packed_seq_params = batch["packed_seq_params"]
         total_lengths = batch["total_lengths"]
         response_lengths = batch["response_lengths"]
+        use_cce_fast_path = f is get_log_probs_and_entropy and use_cce_log_prob_fast_path(args)
+        output_kind = "token_nll" if use_cce_fast_path else "logits"
+        with_entropy = False if use_cce_fast_path else args.use_rollout_entropy
+
+        forward_kwargs = {
+            "input_ids": tokens,
+            "position_ids": None,
+            "attention_mask": None,
+            "labels": None,
+            "packed_seq_params": packed_seq_params,
+            "loss_mask": batch["full_loss_masks"],
+        }
+        if use_cce_fast_path:
+            forward_kwargs.update(_get_cce_forward_kwargs(args, batch["cce_labels"]))
+        if batch["multimodal_train_inputs"] is not None:
+            forward_kwargs.update(batch["multimodal_train_inputs"])
+
         output_tensor = model(
-            input_ids=tokens,
-            position_ids=None,
-            attention_mask=None,
-            labels=None,
-            packed_seq_params=packed_seq_params,
-            loss_mask=batch["full_loss_masks"],
-            **(batch["multimodal_train_inputs"] if batch["multimodal_train_inputs"] is not None else {}),
+            **forward_kwargs,
         )
 
         return output_tensor, partial(
@@ -240,7 +259,8 @@ def forward_only(
             unconcat_tokens=unconcat_tokens,
             total_lengths=total_lengths,
             response_lengths=response_lengths,
-            with_entropy=args.use_rollout_entropy,
+            with_entropy=with_entropy,
+            output_kind=output_kind,
             max_seq_lens=batch.get("max_seq_lens", None),
         )
 
@@ -386,6 +406,7 @@ def train_one_step(
             old_stage = os.environ["ROUTING_REPLAY_STAGE"]
             os.environ["ROUTING_REPLAY_STAGE"] = "replay_forward"
 
+        output_kind = "logits"
         if return_schedule_plan:
             assert not args.enable_mtp_training, "MTP training should not be enabled when using combined 1f1b"
             output_tensor = model.build_schedule_plan(
@@ -397,6 +418,8 @@ def train_one_step(
                 loss_mask=batch["full_loss_masks"],
             )
         else:
+            use_cce_fast_path = use_cce_log_prob_fast_path(args)
+            output_kind = "token_nll" if use_cce_fast_path else "logits"
             forward_kwargs = {
                 "input_ids": batch["tokens"],
                 "position_ids": None,
@@ -405,6 +428,8 @@ def train_one_step(
                 "packed_seq_params": batch["packed_seq_params"],
                 "loss_mask": batch["full_loss_masks"],
             }
+            if use_cce_fast_path:
+                forward_kwargs.update(_get_cce_forward_kwargs(args, batch["cce_labels"]))
 
             if args.enable_mtp_training:
                 forward_kwargs["mtp_kwargs"] = {"mtp_labels": batch["tokens"]}
@@ -417,7 +442,7 @@ def train_one_step(
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches)
+        return output_tensor, partial(loss_function, args, batch, num_microbatches, output_kind=output_kind)
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()

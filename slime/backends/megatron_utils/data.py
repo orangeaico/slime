@@ -22,6 +22,19 @@ from .cp_utils import get_sum_of_sample_mean, slice_with_cp
 logger = logging.getLogger(__name__)
 
 
+CCE_IGNORE_INDEX = -100
+
+
+def _build_cce_next_token_labels(tokens: list[torch.Tensor]) -> list[torch.Tensor]:
+    labels = []
+    for sample_tokens in tokens:
+        sample_labels = torch.full_like(sample_tokens, CCE_IGNORE_INDEX)
+        if sample_tokens.numel() > 1:
+            sample_labels[:-1] = sample_tokens[1:]
+        labels.append(sample_labels)
+    return labels
+
+
 def get_batch(
     data_iterator: "DataIterator",
     keys: Sequence[str],
@@ -57,6 +70,7 @@ def get_batch(
         batch["dynamic_global_batch_size"] = data_iterator.rollout_data["dynamic_global_batch_size"]
 
     tokens = batch["tokens"]
+    cce_labels = _build_cce_next_token_labels(tokens)
     # use 0 as the pad token id should be fine?
     pad_token_id = 0
     pad_size = mpu.get_tensor_model_parallel_world_size() * pad_multiplier
@@ -71,7 +85,9 @@ def get_batch(
         max_seqlen = batch["max_seq_lens"][0]
         assert max([t.size(0) for t in tokens]) <= max_seqlen
         tokens = [slice_with_cp(t, pad_token_id, qkv_format, max_seqlen) for t in tokens]
+        cce_labels = [slice_with_cp(t, CCE_IGNORE_INDEX, qkv_format, max_seqlen) for t in cce_labels]
         tokens = torch.stack(tokens)
+        cce_labels = torch.stack(cce_labels)
 
     elif qkv_format == "thd":
         if allgather_cp:
@@ -82,6 +98,7 @@ def get_batch(
                 cu_seqlens_list.append(cu_seqlens_list[-1] + t.size(0))
 
             tokens = torch.cat(tokens, dim=0)
+            cce_labels = torch.cat(cce_labels, dim=0)
 
             # Pad global stream so (1) divisible by cp_size (equal chunks),
             # (2) divisible by pad_size (reduce fragmentation).
@@ -89,23 +106,28 @@ def get_batch(
             pad = (global_pad_size - tokens.size(0) % global_pad_size) % global_pad_size
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+                cce_labels = F.pad(cce_labels, (0, pad), value=CCE_IGNORE_INDEX)
                 cu_seqlens_list.append(cu_seqlens_list[-1] + pad)
 
             cu_seqlens = torch.tensor(cu_seqlens_list, dtype=torch.int, device=torch.cuda.current_device())
             tokens = tokens.chunk(cp_size, dim=0)[cp_rank]
+            cce_labels = cce_labels.chunk(cp_size, dim=0)[cp_rank]
         else:
             tokens = [slice_with_cp(t, pad_token_id, qkv_format) for t in tokens]
+            cce_labels = [slice_with_cp(t, CCE_IGNORE_INDEX, qkv_format) for t in cce_labels]
 
             cu_seqlens = [0]
             for t in tokens:
                 cu_seqlens.append(cu_seqlens[-1] + t.size(0))
 
             tokens = torch.cat(tokens)
+            cce_labels = torch.cat(cce_labels)
 
             # Always pad to reduce memory fragmentation and maybe make the computation faster
             pad = (pad_size - tokens.size(0) % pad_size) % pad_size
             if pad != 0:
                 tokens = F.pad(tokens, (0, pad), value=pad_token_id)
+                cce_labels = F.pad(cce_labels, (0, pad), value=CCE_IGNORE_INDEX)
                 cu_seqlens.append(cu_seqlens[-1] + pad)
 
             # thd requires the cu_seqlens to be of the origin length
@@ -121,10 +143,12 @@ def get_batch(
         )
 
         tokens = tokens.unsqueeze(0)
+        cce_labels = cce_labels.unsqueeze(0)
     else:
         raise ValueError(f"Unsupported qkv_format: {qkv_format}")
 
     batch["tokens"] = tokens
+    batch["cce_labels"] = cce_labels
     batch["packed_seq_params"] = packed_seq_params
 
     # loss masks
@@ -447,8 +471,15 @@ def log_rollout_data(
                         val = torch.cat(val).clone().detach()
                         if key in ["advantages", "returns"]:
                             logger.info(f"[DEBUG log_rollout_data] Key '{key}': concatenated tensor shape={val.shape}")
-                            logger.info(f"[DEBUG log_rollout_data] Key '{key}': tensor values (first 20)={val[:20]}")
-                            logger.info(f"[DEBUG log_rollout_data] Key '{key}': min={val.min()}, max={val.max()}, mean={val.mean()}")
+                            if val.numel() == 0:
+                                logger.info(
+                                    f"[DEBUG log_rollout_data] Key '{key}': empty local tensor on this CP rank"
+                                )
+                            else:
+                                logger.info(f"[DEBUG log_rollout_data] Key '{key}': tensor values (first 20)={val[:20]}")
+                                logger.info(
+                                    f"[DEBUG log_rollout_data] Key '{key}': min={val.min()}, max={val.max()}, mean={val.mean()}"
+                                )
 
                         sum_of_sample_mean = get_sum_of_sample_mean(
                             total_lengths,
