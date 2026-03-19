@@ -11,6 +11,7 @@ from slime.utils.scalerl_utils import (
     get_prompt_loss_token_weights,
     get_required_prompt_group_multiple,
     get_train_metric_normalizers,
+    normalize_rewards_for_training,
     should_force_per_token_loss,
     should_discard_prompt,
     update_step_pass_rate_window,
@@ -77,6 +78,55 @@ def test_prompt_loss_token_weights_match_prompt_average_formula():
 
     assert prompt_average.item() == pytest.approx(expected)
     assert weights == pytest.approx([1.0 / 3.0, 1.0 / 3.0, 1.0 / 4.0, 1.0 / 4.0])
+
+
+def test_batch_level_normalization_ignores_inactive_samples():
+    raw_rewards = [1.0, 3.0, 10.0, 14.0]
+    group_indices = [0, 0, 1, 1]
+    active_mask = [True, False, True, True]
+
+    centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices, active_mask=active_mask)
+    normalized_rewards = get_batch_normalized_prompt_rewards(raw_rewards, group_indices, active_mask=active_mask)
+
+    assert centered_rewards.tolist() == pytest.approx([0.0, 0.0, -2.0, 2.0])
+    assert normalized_rewards[1] == pytest.approx(0.0)
+
+    active_centered = torch.tensor([0.0, -2.0, 2.0])
+    expected = torch.tensor([0.0, 0.0, -2.0, 2.0]) / (active_centered.std() + 1e-6)
+    assert torch.allclose(torch.tensor(normalized_rewards), expected)
+
+
+def test_prompt_loss_token_weights_exclude_fully_inactive_groups():
+    group_indices = [0, 0, 1, 1]
+    loss_masks = [
+        [0, 0],
+        [0],
+        [1, 1, 1],
+        [1],
+    ]
+
+    weights, num_prompt_groups = get_prompt_loss_token_weights(loss_masks, group_indices)
+
+    assert weights == pytest.approx([0.0, 0.0, 1.0 / 4.0, 1.0 / 4.0])
+    assert num_prompt_groups == 1
+
+
+def test_normalize_rewards_for_training_zeros_inactive_samples_without_reward_normalization():
+    args = SimpleNamespace(
+        advantage_estimator="grpo",
+        rewards_normalization=False,
+        batch_level_normalization=False,
+        grpo_std_normalization=False,
+    )
+
+    rewards = normalize_rewards_for_training(
+        args,
+        raw_rewards=[1.0, 2.0, 3.0],
+        group_indices=[0, 0, 1],
+        active_mask=[True, False, True],
+    )
+
+    assert rewards == pytest.approx([1.0, 0.0, 3.0])
 
 
 def test_required_prompt_group_multiple_uses_lcm():

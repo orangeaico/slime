@@ -13,6 +13,7 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
+from slime.utils.scalerl_utils import get_active_sample_mask_from_loss_masks
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
 
@@ -23,6 +24,14 @@ logger = logging.getLogger(__name__)
 
 
 CCE_IGNORE_INDEX = -100
+
+
+def _get_active_sample_mask(rollout_data: RolloutBatch) -> list[bool]:
+    active_sample_mask = rollout_data.get("active_sample_mask")
+    if active_sample_mask is not None:
+        return [bool(v) for v in active_sample_mask]
+
+    return get_active_sample_mask_from_loss_masks(rollout_data["loss_masks"])
 
 
 def _build_cce_next_token_labels(tokens: list[torch.Tensor]) -> list[torch.Tensor]:
@@ -436,6 +445,8 @@ def log_rollout_data(
         loss_masks = rollout_data["loss_masks"]
         total_lengths = rollout_data["total_lengths"]
         max_seq_lens = rollout_data.get("max_seq_lens", None)
+        active_sample_mask = _get_active_sample_mask(rollout_data)
+        num_active_samples = max(sum(active_sample_mask), 1)
 
         for key, val in rollout_data.items():
             if key in [
@@ -444,11 +455,13 @@ def log_rollout_data(
                 "loss_masks",
                 "sample_indices",
                 "group_index",
+                "truncated",
                 "prompt_loss_token_weight",
                 "num_prompt_groups",
                 "rollout_routed_experts",
                 "max_seq_lens",
                 "dynamic_global_batch_size",
+                "active_sample_mask",
             ]:
                 continue
             # Upload per sample mean for each rollout value
@@ -488,7 +501,7 @@ def log_rollout_data(
                             qkv_format=args.qkv_format,
                             max_seq_lens=max_seq_lens,
                         )
-                        val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
+                        val = cp_size * sum_of_sample_mean(val) / num_active_samples
 
                         if key in ["advantages", "returns"]:
                             logger.info(f"[DEBUG log_rollout_data] Key '{key}': final value after averaging={val}")
@@ -497,7 +510,11 @@ def log_rollout_data(
                         val = torch.cat(val).clone().detach()
                         val = val.mean() * cp_size
                 else:
-                    val = sum(val) / len(val)
+                    if len(val) == len(active_sample_mask):
+                        active_vals = [item for item, is_active in zip(val, active_sample_mask, strict=True) if is_active]
+                        val = (sum(active_vals) / len(active_vals)) if active_vals else 0.0
+                    else:
+                        val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):
                 val = val.float().mean()
             else:
@@ -532,6 +549,7 @@ def log_rollout_data(
             response_lengths = rollout_data["response_lengths"]
             loss_masks = rollout_data["loss_masks"]
             total_lengths = rollout_data["total_lengths"]
+            active_sample_mask = _get_active_sample_mask(rollout_data)
 
             def quantile(total_value, n_quantiles, data) -> dict:
                 import math
@@ -562,7 +580,7 @@ def log_rollout_data(
             correct_loss_masks = []
             correct_entropy = []
             for i, raw_reward in enumerate(raw_rewards):
-                if raw_reward == 1:
+                if active_sample_mask[i] and raw_reward == 1:
                     correct_response_lengths.append(response_lengths[i])
                     correct_total_lengths.append(total_lengths[i])
                     correct_loss_masks.append(loss_masks[i])
@@ -594,13 +612,20 @@ def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutB
     """
     if mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage():
         log_dict = {}
+        active_sample_mask = _get_active_sample_mask(rollout_data)
         for key, val in rollout_data.items():
             if key == "loss_masks":
                 if val:  # Check if val is not empty
                     device = val[0].device  # Get device from first tensor
 
                     # Vectorized length calculation using torch
-                    raw_response_lengths = torch.tensor([v.shape[0] for v in val], dtype=torch.float32, device=device)
+                    raw_response_lengths = torch.tensor(
+                        [v.shape[0] for v, is_active in zip(val, active_sample_mask, strict=True) if is_active],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    if raw_response_lengths.numel() == 0:
+                        continue
                     log_dict["raw_response_length/response_length_mean"] = raw_response_lengths.mean().item()
                     log_dict["raw_response_length/response_length_max"] = raw_response_lengths.max().item()
                     log_dict["raw_response_length/response_length_min"] = raw_response_lengths.min().item()
@@ -610,14 +635,20 @@ def log_multi_turn_data(rollout_id: int, args: Namespace, rollout_data: RolloutB
 
                     # Vectorized sum calculation using torch - stay on GPU
                     wo_obs_response_lengths = torch.tensor(
-                        [v.sum().item() for v in val], dtype=torch.float32, device=device
+                        [v.sum().item() for v, is_active in zip(val, active_sample_mask, strict=True) if is_active],
+                        dtype=torch.float32,
+                        device=device,
                     )
                     log_dict["wo_obs_response_length/response_length_mean"] = wo_obs_response_lengths.mean().item()
                     log_dict["wo_obs_response_length/response_length_max"] = wo_obs_response_lengths.max().item()
                     log_dict["wo_obs_response_length/response_length_min"] = wo_obs_response_lengths.min().item()
             if key == "round_number":
                 # Use numpy for vectorized round number statistics
-                round_number_array = np.array(val)
+                round_number_array = np.array(
+                    [round_number for round_number, is_active in zip(val, active_sample_mask, strict=True) if is_active]
+                )
+                if round_number_array.size == 0:
+                    continue
                 log_dict["multi_turn_metric/round_number_mean"] = np.mean(round_number_array)
                 log_dict["multi_turn_metric/round_number_max"] = np.max(round_number_array)
                 log_dict["multi_turn_metric/round_number_min"] = np.min(round_number_array)

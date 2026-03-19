@@ -29,6 +29,7 @@ from slime.utils.scalerl_utils import (
     get_prompt_group_mean_centered_rewards,
     get_prompt_loss_token_weights,
     get_required_prompt_group_multiple,
+    normalize_rewards_for_training,
 )
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import Sample
@@ -48,6 +49,18 @@ def _requires_prompt_group_alignment(args) -> bool:
 
 def _get_sample_group_indices(samples: list[Sample], n_samples_per_prompt: int) -> list[int]:
     return get_prompt_group_indices([sample.group_index for sample in samples], n_samples_per_prompt)
+
+
+def _is_sample_active_for_training(sample: Sample) -> bool:
+    if sample.remove_sample:
+        return False
+    if sample.loss_mask is None:
+        return True
+    return sum(sample.loss_mask) > 0
+
+
+def _get_active_samples(samples: list[Sample]) -> list[Sample]:
+    return [sample for sample in samples if _is_sample_active_for_training(sample)]
 
 
 def _get_dp_partitions(
@@ -545,45 +558,70 @@ class RolloutManager:
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:
-            return self.custom_reward_post_process_func(self.args, samples)
+            raw_rewards, normalized_rewards = self.custom_reward_post_process_func(self.args, samples)
+            active_mask = [not sample.remove_sample for sample in samples]
+            normalized_rewards = [
+                reward if is_active else 0.0
+                for reward, is_active in zip(normalized_rewards, active_mask, strict=True)
+            ]
+            return raw_rewards, normalized_rewards
 
         raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         group_indices = _get_sample_group_indices(samples, self.args.n_samples_per_prompt)
+        active_mask = [not sample.remove_sample for sample in samples]
+        active_raw_rewards = [reward for reward, is_active in zip(raw_rewards, active_mask, strict=True) if is_active]
         logger.info(f"[DEBUG] Raw rewards (extracted from samples): {raw_rewards}")
-        logger.info(f"[DEBUG] Raw rewards stats: min={min(raw_rewards)}, max={max(raw_rewards)}, mean={sum(raw_rewards)/len(raw_rewards)}")
+        if active_raw_rewards:
+            logger.info(
+                "[DEBUG] Active raw rewards stats: "
+                f"min={min(active_raw_rewards)}, max={max(active_raw_rewards)}, "
+                f"mean={sum(active_raw_rewards)/len(active_raw_rewards)}"
+            )
+        else:
+            logger.info("[DEBUG] No active samples remain for reward normalization.")
 
         if (
             self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
             and self.args.rewards_normalization
         ):
-            centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices)
+            centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices, active_mask=active_mask)
             logger.info(f"[DEBUG] Mean-centered rewards by group: {centered_rewards}")
 
             if self.args.batch_level_normalization:
-                normalized_rewards = get_batch_normalized_prompt_rewards(raw_rewards, group_indices)
-                logger.info(f"[DEBUG] Rewards after batch-level normalization: {normalized_rewards}")
-            elif self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                normalized_rewards = centered_rewards.clone()
-                grouped_indices = group_by(list(range(len(group_indices))), lambda idx: group_indices[idx])
-                for group_sample_indices in grouped_indices.values():
-                    group_rewards = centered_rewards[group_sample_indices]
-                    group_std = group_rewards.std()
-                    normalized_rewards[group_sample_indices] = group_rewards / (group_std + 1e-6)
-                normalized_rewards = normalized_rewards.tolist()
-                logger.info(f"[DEBUG] Rewards after prompt-level std division: {normalized_rewards}")
-            else:
-                normalized_rewards = centered_rewards.tolist()
-                logger.info(
-                    f"[DEBUG] Skipping std normalization "
-                    f"(batch_level_normalization={self.args.batch_level_normalization}, "
-                    f"grpo_std_normalization={self.args.grpo_std_normalization})"
+                normalized_rewards = get_batch_normalized_prompt_rewards(
+                    raw_rewards,
+                    group_indices,
+                    active_mask=active_mask,
                 )
+                logger.info(f"[DEBUG] Rewards after batch-level normalization: {normalized_rewards}")
+            else:
+                normalized_rewards = normalize_rewards_for_training(
+                    self.args,
+                    raw_rewards,
+                    group_indices,
+                    active_mask=active_mask,
+                )
+                if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+                    logger.info(f"[DEBUG] Rewards after prompt-level std division: {normalized_rewards}")
+                else:
+                    logger.info(
+                        f"[DEBUG] Skipping std normalization "
+                        f"(batch_level_normalization={self.args.batch_level_normalization}, "
+                        f"grpo_std_normalization={self.args.grpo_std_normalization})"
+                    )
 
-            logger.info(f"[DEBUG] Sum of normalized rewards: {sum(normalized_rewards)}, Mean: {sum(normalized_rewards)/len(normalized_rewards)}")
+            logger.info(
+                f"[DEBUG] Sum of normalized rewards: {sum(normalized_rewards)}, Mean: {sum(normalized_rewards)/len(normalized_rewards)}"
+            )
             return raw_rewards, normalized_rewards
 
         logger.info(f"[DEBUG] Skipping reward normalization (rewards_normalization={self.args.rewards_normalization})")
-        return raw_rewards, raw_rewards
+        return raw_rewards, normalize_rewards_for_training(
+            self.args,
+            raw_rewards,
+            group_indices,
+            active_mask=active_mask,
+        )
 
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """
@@ -624,12 +662,12 @@ class RolloutManager:
                 sample.loss_mask = [0] * sample.response_length
             loss_masks.append(sample.loss_mask)
         train_data["loss_masks"] = loss_masks
+        train_data["active_sample_mask"] = [1 if sum(loss_mask) > 0 else 0 for loss_mask in loss_masks]
 
         if self.args.prompt_level_loss_aggregation:
-            prompt_loss_token_weight, _ = get_prompt_loss_token_weights(loss_masks, train_data["group_index"])
-            global_batch_size = getattr(self, "_dynamic_global_batch_size", self.args.global_batch_size)
+            prompt_loss_token_weight, num_prompt_groups = get_prompt_loss_token_weights(loss_masks, train_data["group_index"])
             train_data["prompt_loss_token_weight"] = prompt_loss_token_weight
-            train_data["num_prompt_groups"] = global_batch_size // self.args.n_samples_per_prompt
+            train_data["num_prompt_groups"] = num_prompt_groups
 
         # overwriting the raw reward
         if samples[0].metadata and "raw_reward" in samples[0].metadata:
@@ -696,6 +734,7 @@ class RolloutManager:
                 "prompt_loss_token_weight",
                 "round_number",
                 "sample_indices",
+                "active_sample_mask",
                 "rollout_log_probs",
                 "rollout_routed_experts",
                 "prompt",
@@ -993,33 +1032,51 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
 
 def compute_metrics_from_samples(args, samples):
-    response_lengths = [sample.effective_response_length for sample in samples]
+    raw_truncated_ratio = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item() if samples else 0.0
+    active_samples = _get_active_samples(samples)
+    if not active_samples:
+        return {
+            "response_len/mean": 0.0,
+            "response_len/median": 0.0,
+            "response_len/max": 0.0,
+            "response_len/min": 0.0,
+            "repetition_frac": 0.0,
+            "truncated_ratio": raw_truncated_ratio,
+        }
+
+    response_lengths = [sample.effective_response_length for sample in active_samples]
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
-    log_dict |= compute_scalerl_metrics_from_samples(args, samples)
-    log_dict |= _compute_zero_std_metrics(args, samples)
-    log_dict |= _compute_reward_cat_metrics(args, samples)
-    log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
-    log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
+    log_dict |= compute_scalerl_metrics_from_samples(args, active_samples)
+    log_dict |= _compute_zero_std_metrics(args, active_samples)
+    log_dict |= _compute_reward_cat_metrics(args, active_samples)
+    log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in active_samples]).item()
+    log_dict["truncated_ratio"] = raw_truncated_ratio
     return log_dict
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):
-    non_generation_time = [sample.non_generation_time for sample in samples]
+    active_samples = _get_active_samples(samples)
+    non_generation_time = [sample.non_generation_time for sample in active_samples]
 
     log_dict = {}
     log_dict["rollout_time"] = rollout_time
-    if max(non_generation_time) > 0:
+    if non_generation_time and max(non_generation_time) > 0:
         log_dict |= dict_add_prefix(compute_statistics(non_generation_time), "non_generation_time/")
 
     def token_perf(response_lengths, non_generation_time, key=""):
+        if not response_lengths:
+            if args.rollout_num_gpus:
+                log_dict[f"{key}tokens_per_gpu_per_sec"] = 0.0
+            log_dict[f"longest_{key}sample_tokens_per_sec"] = 0.0
+            return
         max_response_length = max(response_lengths)
         if args.rollout_num_gpus:
             log_dict[f"{key}tokens_per_gpu_per_sec"] = sum(response_lengths) / rollout_time / args.rollout_num_gpus
         log_dict[f"longest_{key}sample_tokens_per_sec"] = max_response_length / rollout_time
 
-        if max(non_generation_time) == 0:
+        if not non_generation_time or max(non_generation_time) == 0:
             return
 
         non_generation_time = [
@@ -1032,8 +1089,8 @@ def compute_perf_metrics_from_samples(args, samples, rollout_time):
             rollout_time - mean_non_generation_time
         )
 
-    token_perf([sample.response_length for sample in samples], non_generation_time, key="")
-    token_perf([sample.effective_response_length for sample in samples], non_generation_time, key="effective_")
+    token_perf([sample.response_length for sample in active_samples], non_generation_time, key="")
+    token_perf([sample.effective_response_length for sample in active_samples], non_generation_time, key="effective_")
 
     return log_dict
 
