@@ -428,26 +428,38 @@ def _get_gold_context(sample) -> GoldContext:
 
 
 def _parse_response_json(response_text: str) -> tuple[bool, Any]:
+    """Parse JSON from response text by finding the outermost braces.
+
+    Args:
+        response_text: Raw response text that may contain JSON
+
+    Returns:
+        Tuple of (success, parsed_data). If parsing fails, returns (False, None).
+    """
     if not isinstance(response_text, str):
         return False, None
 
-    stripped = response_text.strip()
-    if not stripped:
+    if not response_text.strip():
         return False, None
 
     try:
-        return True, json.loads(stripped)
-    except json.JSONDecodeError:
-        pass
+        start = response_text.find('{')
+        end = response_text.rfind('}')
 
-    fenced_match = re.search(r"```json\s*(.*?)\s*```", stripped, flags=re.IGNORECASE | re.DOTALL)
-    if fenced_match is not None:
-        try:
-            return True, json.loads(fenced_match.group(1))
-        except json.JSONDecodeError:
+        if start == -1 or end == -1:
             return False, None
 
-    return False, None
+        if start > end:
+            return False, None
+
+        json_str = response_text[start:end + 1]
+        parsed = json.loads(json_str)
+        return True, parsed
+
+    except json.JSONDecodeError:
+        return False, None
+    except (AttributeError, TypeError):
+        return False, None
 
 
 def _score_prediction(sample, parsed_output: Any, json_valid: bool) -> dict[str, Any]:
