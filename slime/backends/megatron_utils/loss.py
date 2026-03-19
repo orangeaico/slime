@@ -27,6 +27,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_returns,
 )
 from slime.utils.scalerl_utils import get_train_metric_normalizers
+from slime.utils.scalerl_utils import get_active_sample_mask_from_loss_masks
 from slime.utils.types import RolloutBatch
 
 from .cp_utils import (
@@ -1085,7 +1086,7 @@ def loss_function(
           (1D tensor of per-metric denominators).
     """
     num_tokens = sum([torch.clamp_min(loss_mask.sum(), 1) for loss_mask in batch["loss_masks"]])
-    num_samples = len(batch["response_lengths"])
+    num_samples = sum(get_active_sample_mask_from_loss_masks(batch["loss_masks"]))
     global_batch_size = batch.get("dynamic_global_batch_size", args.global_batch_size)
     num_prompt_groups = batch.get("num_prompt_groups", global_batch_size // args.n_samples_per_prompt)
 

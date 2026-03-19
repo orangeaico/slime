@@ -108,6 +108,7 @@ ROLLOUT_ARGS=(
    --rollout-top-p 0.8
    --rollout-top-k 20
    --use-rollout-logprobs
+# --rollout-sample-filter-path slime.rollout.filter_hub.sample_filters.mark_truncated_samples_inactive
 
    --global-batch-size 64
    --balance-data

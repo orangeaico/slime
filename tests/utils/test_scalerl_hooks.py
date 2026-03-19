@@ -5,6 +5,7 @@ import pytest
 import slime.rollout.data_source as rollout_data_source_module
 from slime.rollout.data_source import ScaleRLRolloutDataSourceWithBuffer
 from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std_with_dapo_style
+from slime.rollout.filter_hub.sample_filters import mark_truncated_samples_inactive
 from slime.rollout.scalerl import (
     APF_METADATA_KEY,
     APF_STEP_PASS_RATES_KEY,
@@ -257,3 +258,25 @@ def test_dapo_style_dynamic_filter_and_reward_post_process(tmp_path):
     rollout_metrics = compute_scalerl_metrics_from_samples(args, varied_length_group)
     assert rollout_metrics["scalerl/penalty_delta_mean"] == pytest.approx(-0.25)
     assert rollout_metrics["scalerl/penalized_sample_frac"] == pytest.approx(0.5)
+
+
+def test_truncated_samples_can_be_marked_inactive_and_ignored_in_post_filter_metrics(tmp_path):
+    args = _make_args(tmp_path)
+    samples = [
+        _make_reward_sample(prompt_id=0, group_index=0, reward=1.0, response_length=8, index=0),
+        _make_reward_sample(prompt_id=0, group_index=0, reward=1.0, response_length=9, index=1),
+    ]
+    samples[1].status = Sample.Status.TRUNCATED
+
+    mark_truncated_samples_inactive(args, [samples])
+
+    assert samples[0].remove_sample is False
+    assert samples[1].remove_sample is True
+
+    raw_rewards, shaped_rewards = post_process_rewards_with_dapo_style(args, samples)
+    assert raw_rewards == pytest.approx([1.0, 1.0])
+    assert shaped_rewards == pytest.approx([1.0, 0.0])
+
+    rollout_metrics = compute_scalerl_metrics_from_samples(args, samples)
+    assert rollout_metrics["scalerl/penalty_delta_mean"] == pytest.approx(0.0)
+    assert rollout_metrics["scalerl/penalized_sample_frac"] == pytest.approx(0.0)

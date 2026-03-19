@@ -4,6 +4,24 @@ from collections.abc import Sequence
 import torch
 
 
+def _resolve_active_mask(
+    active_mask: Sequence[bool] | None,
+    *,
+    length: int,
+) -> list[bool]:
+    if active_mask is None:
+        return [True] * length
+
+    resolved_mask = [bool(v) for v in active_mask]
+    if len(resolved_mask) != length:
+        raise ValueError(f"active_mask length {len(resolved_mask)} does not match expected length {length}.")
+    return resolved_mask
+
+
+def get_active_sample_mask_from_loss_masks(loss_masks: Sequence[Sequence[int]]) -> list[bool]:
+    return [sum(loss_mask) > 0 for loss_mask in loss_masks]
+
+
 def get_prompt_group_indices(group_indices: Sequence[int | None], n_samples_per_prompt: int) -> list[int]:
     resolved_group_indices = []
     for sample_idx, group_index in enumerate(group_indices):
@@ -16,12 +34,16 @@ def get_prompt_group_indices(group_indices: Sequence[int | None], n_samples_per_
 def get_prompt_group_mean_centered_rewards(
     raw_rewards: Sequence[float],
     group_indices: Sequence[int],
+    active_mask: Sequence[bool] | None = None,
 ) -> torch.Tensor:
     rewards = torch.tensor(raw_rewards, dtype=torch.float32)
-    centered_rewards = torch.empty_like(rewards)
+    centered_rewards = torch.zeros_like(rewards)
+    resolved_active_mask = _resolve_active_mask(active_mask, length=len(raw_rewards))
 
     rewards_by_group: dict[int, list[tuple[int, float]]] = {}
-    for idx, (reward, group_index) in enumerate(zip(raw_rewards, group_indices, strict=True)):
+    for idx, (reward, group_index, is_active) in enumerate(zip(raw_rewards, group_indices, resolved_active_mask, strict=True)):
+        if not is_active:
+            continue
         rewards_by_group.setdefault(group_index, []).append((idx, reward))
 
     for entries in rewards_by_group.values():
@@ -37,10 +59,13 @@ def get_batch_normalized_prompt_rewards(
     raw_rewards: Sequence[float],
     group_indices: Sequence[int],
     eps: float = 1e-6,
+    active_mask: Sequence[bool] | None = None,
 ) -> list[float]:
-    centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices)
-    if centered_rewards.numel() > 1:
-        batch_std = centered_rewards.std()
+    centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices, active_mask=active_mask)
+    resolved_active_mask = _resolve_active_mask(active_mask, length=len(raw_rewards))
+    active_centered_rewards = centered_rewards[torch.tensor(resolved_active_mask, dtype=torch.bool)]
+    if active_centered_rewards.numel() > 1:
+        batch_std = active_centered_rewards.std()
     else:
         batch_std = torch.zeros((), dtype=centered_rewards.dtype)
     return (centered_rewards / (batch_std + eps)).tolist()
@@ -59,7 +84,8 @@ def get_prompt_loss_token_weights(
         prompt_token_count = prompt_token_counts[group_index]
         weights.append(0.0 if prompt_token_count <= 0 else 1.0 / prompt_token_count)
 
-    return weights, len(prompt_token_counts)
+    num_prompt_groups = sum(prompt_token_count > 0 for prompt_token_count in prompt_token_counts.values())
+    return weights, num_prompt_groups
 
 
 def get_required_prompt_group_multiple(
@@ -147,30 +173,38 @@ def normalize_rewards_for_training(
     args,
     raw_rewards: Sequence[float],
     group_indices: Sequence[int],
+    active_mask: Sequence[bool] | None = None,
 ) -> list[float]:
     if (
         args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
         and args.rewards_normalization
     ):
-        centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices)
+        centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices, active_mask=active_mask)
+        resolved_active_mask = _resolve_active_mask(active_mask, length=len(raw_rewards))
 
         if args.batch_level_normalization:
-            return get_batch_normalized_prompt_rewards(raw_rewards, group_indices)
+            return get_batch_normalized_prompt_rewards(raw_rewards, group_indices, active_mask=resolved_active_mask)
 
         if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
             normalized_rewards = centered_rewards.clone()
             grouped_indices: dict[int, list[int]] = {}
-            for sample_idx, group_index in enumerate(group_indices):
+            for sample_idx, (group_index, is_active) in enumerate(zip(group_indices, resolved_active_mask, strict=True)):
+                if not is_active:
+                    continue
                 grouped_indices.setdefault(group_index, []).append(sample_idx)
             for group_sample_indices in grouped_indices.values():
                 group_rewards = centered_rewards[group_sample_indices]
-                group_std = group_rewards.std()
+                group_std = group_rewards.std() if len(group_sample_indices) > 1 else torch.zeros((), dtype=group_rewards.dtype)
                 normalized_rewards[group_sample_indices] = group_rewards / (group_std + 1e-6)
             return normalized_rewards.tolist()
 
         return centered_rewards.tolist()
 
-    return list(raw_rewards)
+    resolved_rewards = list(raw_rewards)
+    if active_mask is None:
+        return resolved_rewards
+
+    return [reward if is_active else 0.0 for reward, is_active in zip(resolved_rewards, active_mask, strict=True)]
 
 
 def get_train_metric_normalizers(

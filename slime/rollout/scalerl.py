@@ -68,6 +68,10 @@ def get_shaped_rewards(args, samples: Sequence[Sample]) -> tuple[list[float], li
     return raw_rewards, shaped_rewards
 
 
+def get_active_sample_mask(samples: Sequence[Sample]) -> list[bool]:
+    return [not sample.remove_sample for sample in samples]
+
+
 def attach_scalerl_rollout_metrics(samples: Sequence[Sample], metrics: dict[str, float]) -> None:
     for sample in samples:
         metadata = dict(sample.metadata) if isinstance(sample.metadata, dict) else {}
@@ -85,20 +89,21 @@ def _resolve_scalerl_data_source(data_source_getter: Callable[..., Any]):
 
 
 def compute_scalerl_metrics_from_samples(args, samples: list[Sample]) -> dict[str, float]:
-    if not samples:
+    active_samples = [sample for sample in samples if not sample.remove_sample]
+    if not active_samples:
         return {}
 
     metrics: dict[str, float] = {}
 
     if getattr(args, "length_penalty_type", "none") == "dapo_style":
-        raw_rewards, shaped_rewards = get_shaped_rewards(args, samples)
+        raw_rewards, shaped_rewards = get_shaped_rewards(args, active_samples)
         penalty_deltas = [shaped_reward - raw_reward for raw_reward, shaped_reward in zip(raw_rewards, shaped_rewards, strict=True)]
 
         metrics["scalerl/penalty_delta_mean"] = sum(penalty_deltas) / len(penalty_deltas)
         metrics["scalerl/penalized_sample_frac"] = sum(delta != 0.0 for delta in penalty_deltas) / len(penalty_deltas)
 
     rollout_metrics = None
-    for sample in samples:
+    for sample in active_samples:
         metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
         if SCALERL_ROLLOUT_METRICS_METADATA_KEY in metadata:
             rollout_metrics = metadata[SCALERL_ROLLOUT_METRICS_METADATA_KEY]
@@ -120,7 +125,12 @@ def post_process_rewards_with_dapo_style(args, samples: list[Sample] | list[list
         sample.metadata = metadata
 
     group_indices = get_prompt_group_indices([sample.group_index for sample in flat_samples], args.n_samples_per_prompt)
-    normalized_rewards = normalize_rewards_for_training(args, shaped_rewards, group_indices)
+    normalized_rewards = normalize_rewards_for_training(
+        args,
+        shaped_rewards,
+        group_indices,
+        active_mask=get_active_sample_mask(flat_samples),
+    )
     return raw_rewards, normalized_rewards
 
 
