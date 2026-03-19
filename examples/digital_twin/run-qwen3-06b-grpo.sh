@@ -26,16 +26,14 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 REPO_ROOT="$(cd -- "$SCRIPT_DIR/../.." &>/dev/null && pwd)"
 
 DEFAULT_MEGATRON_LM_ROOT="/root/Megatron-LM"
-if [[ ! -d "$DEFAULT_MEGATRON_LM_ROOT" ]]; then
-    DEFAULT_MEGATRON_LM_ROOT="/home/surya/livup/Megatron-LM"
-fi
 MEGATRON_LM_ROOT="${MEGATRON_LM_ROOT:-$DEFAULT_MEGATRON_LM_ROOT}"
 
 source "${REPO_ROOT}/scripts/models/qwen3-0.6B.sh"
+source "${REPO_ROOT}/.env"
 
 DIGITAL_TWIN_DATA_DIR="${DIGITAL_TWIN_DATA_DIR:-${REPO_ROOT}/examples/digital_twin/data}"
-TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${DIGITAL_TWIN_DATA_DIR}/train.jsonl}"
-EVAL_DATA_PATH="${EVAL_DATA_PATH:-${DIGITAL_TWIN_DATA_DIR}/eval.jsonl}"
+TRAIN_DATA_PATH="${TRAIN_DATA_PATH:-${DIGITAL_TWIN_DATA_DIR}/train_smoke.jsonl}"
+EVAL_DATA_PATH="${EVAL_DATA_PATH:-${DIGITAL_TWIN_DATA_DIR}/eval_smoke.jsonl}"
 
 DEFAULT_HF_CHECKPOINT="/home/shared/megatron_dir/hf_models/Qwen3-0.6B"
 if [[ ! -e "${DEFAULT_HF_CHECKPOINT}" ]]; then
@@ -97,11 +95,11 @@ ROLLOUT_ARGS=(
    --custom-rm-path examples.digital_twin.reward.reward_func
    --reward-key score
 
-   --num-rollout "${NUM_ROLLOUT:-64}"
-   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-4}"
+   --num-rollout "${NUM_ROLLOUT:-2}"
+   --rollout-batch-size "${ROLLOUT_BATCH_SIZE:-2}"
    --num-steps-per-rollout "${NUM_STEPS_PER_ROLLOUT:-1}"
-   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE:-8}"
-   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-4}"
+   --over-sampling-batch-size "${OVER_SAMPLING_BATCH_SIZE:-4}"
+   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT:-2}"
    --rollout-max-context-len "${MAX_CONTEXT_LEN}"
    --rollout-max-prompt-len "${MAX_PROMPT_LEN}"
    --rollout-max-response-len "${MAX_RESPONSE_LEN}"
@@ -111,7 +109,7 @@ ROLLOUT_ARGS=(
    --rollout-top-k "${ROLLOUT_TOP_K:-20}"
    --use-rollout-logprobs
 
-   --global-batch-size "${GLOBAL_BATCH_SIZE:-16}"
+   --global-batch-size "${GLOBAL_BATCH_SIZE:-4}"
    --balance-data
 )
 
@@ -122,7 +120,7 @@ RM_ARGS=(
 EVAL_ARGS=(
    --eval-interval "${EVAL_INTERVAL:-10}"
    --eval-prompt-data twin2k500 "${EVAL_DATA_PATH}"
-   --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-2}"
+   --n-samples-per-eval-prompt "${N_SAMPLES_PER_EVAL_PROMPT:-1}"
    --eval-input-key messages
    --eval-label-key label
    --eval-max-response-len "${MAX_RESPONSE_LEN}"
@@ -169,10 +167,10 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   # --use-wandb
-   # --wandb-project slime-digital-twin
-   # --wandb-group qwen3-06b-digital-twin
-   # --wandb-key "${WANDB_KEY}"
+   --use-wandb
+   --wandb-project slime-digital-twin
+   --wandb-group qwen3-06b-digital-twin
+   --wandb-key "${WANDB_KEY}"
 )
 
 SGLANG_ARGS=(
@@ -181,6 +179,7 @@ SGLANG_ARGS=(
    --sglang-context-length "${MAX_CONTEXT_LEN}"
    --sglang-json-model-override-args "${SGLANG_JSON_MODEL_OVERRIDE_ARGS}"
    --partial-rollout
+   # --sglang-enable-fp32-lm-head
 )
 
 MISC_ARGS=(
@@ -189,6 +188,7 @@ MISC_ARGS=(
    --attention-backend flash
    --cross-entropy-loss-fusion
    --cross-entropy-fusion-impl te
+# --fp32-lm-head
    --bf16
    --use-distributed-optimizer
    --use-precision-aware-optimizer
