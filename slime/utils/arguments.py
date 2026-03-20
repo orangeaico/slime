@@ -550,6 +550,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "If both `--num-epoch` and `--num-rollout` are set, `--num-epoch` will be ignored."
                 ),
             )
+            parser.add_argument(
+                "--max-fresh-prompt-passes",
+                type=int,
+                default=None,
+                help=(
+                    "Optional early-stop condition for global-dataset rollout. "
+                    "Training stops after completing the current rollout batch once every active prompt "
+                    "has been freshly drawn at least this many times. "
+                    "Buffer replays and partial-rollout continuations do not count."
+                ),
+            )
 
             parser.add_argument(
                 "--disable-rollout-global-dataset",
@@ -1705,6 +1716,12 @@ def slime_validate_args(args):
 
     if args.save_interval is not None:
         assert args.save is not None, "'--save' is required when save_interval is set."
+
+    if args.max_fresh_prompt_passes is not None:
+        if args.max_fresh_prompt_passes <= 0:
+            raise ValueError("--max-fresh-prompt-passes must be greater than 0.")
+        if not args.rollout_global_dataset:
+            raise ValueError("--max-fresh-prompt-passes requires rollout_global_dataset to be enabled.")
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 

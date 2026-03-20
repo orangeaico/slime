@@ -43,6 +43,19 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _default_early_stop_status() -> dict[str, Any]:
+    return {
+        "should_stop_after_training_batch": False,
+        "reason": None,
+        "max_fresh_prompt_passes": None,
+        "active_prompt_count": 0,
+        "completed_active_prompt_count": 0,
+        "min_active_prompt_fresh_passes": 0,
+        "max_active_prompt_fresh_passes": 0,
+        "active_prompt_completion_ratio": 0.0,
+    }
+
+
 def _requires_prompt_group_alignment(args) -> bool:
     return args.batch_level_normalization or args.prompt_level_loss_aggregation
 
@@ -337,6 +350,7 @@ class RolloutManager:
             self.server = start_rollout_server(args, pg)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
+        self._last_generate_status = _default_early_stop_status()
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -385,6 +399,9 @@ class RolloutManager:
         assert self.args.rollout_global_dataset
         return len(self.data_source) // self.args.rollout_batch_size
 
+    def get_last_generate_status(self):
+        return dict(self._last_generate_status)
+
     def generate(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
@@ -416,6 +433,7 @@ class RolloutManager:
 
     def load(self, rollout_id=None):
         self.data_source.load(rollout_id)
+        self._last_generate_status = _default_early_stop_status()
 
     def offload(self):
         self.health_monitoring_pause()
@@ -458,6 +476,11 @@ class RolloutManager:
     def check_weights(self, action: str):
         return ray.get([engine.check_weights.remote(action=action) for engine in self.rollout_engines])
 
+    def _compute_early_stop_status(self) -> dict[str, Any]:
+        if hasattr(self.data_source, "get_early_stop_status"):
+            return dict(self.data_source.get_early_stop_status())
+        return _default_early_stop_status()
+
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
             data = torch.load(
@@ -473,10 +496,23 @@ class RolloutManager:
                     f"Subsample loaded debug rollout data using {ratio=} and change num rows {original_num_rows} -> {len(data)}"
                 )
             metrics = None
+            self._last_generate_status = _default_early_stop_status()
         else:
-            data = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
-            metrics = data.metrics
-            data = data.samples
+            rollout_output = call_rollout_fn(self.generate_rollout, self.args, rollout_id, self.data_source, evaluation=False)
+            metrics = dict(rollout_output.metrics or {})
+            self._last_generate_status = self._compute_early_stop_status()
+            metrics |= {
+                f"early_stop/{key}": (int(value) if isinstance(value, bool) else value)
+                for key, value in self._last_generate_status.items()
+                if key != "reason" and value is not None
+            }
+            if self._last_generate_status["should_stop_after_training_batch"]:
+                logger.info(
+                    "Early stop condition satisfied after rollout %s: %s",
+                    rollout_id,
+                    self._last_generate_status,
+                )
+            data = rollout_output.samples
             # flatten the data if it is a list of lists
             while isinstance(data[0], list):
                 data = list(itertools.chain.from_iterable(data))

@@ -35,6 +35,7 @@ class FakeDataset:
 def _make_args(tmp_path, **overrides):
     base_args = dict(
         rollout_global_dataset=True,
+        max_fresh_prompt_passes=None,
         hf_checkpoint="dummy",
         dump_details=None,
         prompt_data=str(tmp_path / "unused.jsonl"),
@@ -111,6 +112,38 @@ def test_custom_data_source_assigns_prompt_ids_and_skips_retired_prompts(tmp_pat
     skipped_metrics = data_source.record_step_pass_rates({})
     assert skipped_metrics["skip_prompt_draw_count"] == pytest.approx(1.0)
     assert skipped_metrics["kept_retired_prompt_draw_count"] == pytest.approx(0.0)
+
+
+def test_fresh_prompt_passes_increment_only_for_fresh_dataset_draws(tmp_path, patched_dataset):
+    args = _make_args(tmp_path, max_fresh_prompt_passes=1)
+    data_source = ScaleRLRolloutDataSourceWithBuffer(args)
+
+    fresh_groups = data_source.get_samples(1)
+    assert data_source.get_prompt_fresh_pass_count(0) == 1
+
+    data_source.add_samples(fresh_groups)
+    replayed_groups = data_source.get_samples(1)
+
+    assert replayed_groups[0][0].metadata[PROMPT_ID_METADATA_KEY] == 0
+    assert data_source.get_prompt_fresh_pass_count(0) == 1
+
+
+def test_early_stop_status_uses_only_active_prompts(tmp_path, patched_dataset):
+    args = _make_args(tmp_path, max_fresh_prompt_passes=1, adaptive_prompt_filter_window_steps=1)
+    data_source = ScaleRLRolloutDataSourceWithBuffer(args)
+
+    data_source.get_samples(2)
+    initial_status = data_source.get_early_stop_status()
+    assert initial_status["should_stop_after_training_batch"] is False
+    assert initial_status["active_prompt_count"] == 3
+    assert initial_status["completed_active_prompt_count"] == 2
+
+    data_source.record_step_pass_rates({2: 1.0})
+    stop_status = data_source.get_early_stop_status()
+    assert stop_status["should_stop_after_training_batch"] is True
+    assert stop_status["active_prompt_count"] == 2
+    assert stop_status["completed_active_prompt_count"] == 2
+    assert stop_status["reason"] is not None
 
 
 def test_custom_data_source_raises_when_no_eligible_prompts_remain(tmp_path, patched_dataset):
@@ -221,8 +254,9 @@ def test_update_step_window_apf_aggregates_multiple_groups_per_prompt(tmp_path, 
 
 
 def test_apf_state_survives_save_and_load(tmp_path, patched_dataset):
-    args = _make_args(tmp_path)
+    args = _make_args(tmp_path, max_fresh_prompt_passes=2)
     data_source = ScaleRLRolloutDataSourceWithBuffer(args)
+    data_source.get_samples(2)
     data_source.record_step_pass_rates({0: 1.0, 1: 0.5})
     data_source.record_step_pass_rates({0: 1.0})
     data_source.save(3)
@@ -234,6 +268,8 @@ def test_apf_state_survives_save_and_load(tmp_path, patched_dataset):
     assert reloaded_data_source.metadata[APF_METADATA_KEY][APF_STEP_PASS_RATES_KEY] == data_source.metadata[APF_METADATA_KEY][APF_STEP_PASS_RATES_KEY]
     assert reloaded_data_source.get_prompt_step_pass_rates(0) == pytest.approx([1.0, 1.0])
     assert reloaded_data_source.get_prompt_step_pass_rates(1) == pytest.approx([0.5])
+    assert reloaded_data_source.get_prompt_fresh_pass_count(0) == 1
+    assert reloaded_data_source.get_prompt_fresh_pass_count(1) == 1
 
 
 def test_dapo_style_dynamic_filter_and_reward_post_process(tmp_path):

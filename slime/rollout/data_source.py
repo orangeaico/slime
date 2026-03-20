@@ -24,6 +24,8 @@ logger = logging.getLogger(__name__)
 APF_SKIP_DRAW_COUNT_KEY = "skip_prompt_draw_count"
 APF_KEEP_DRAW_COUNT_KEY = "kept_retired_prompt_draw_count"
 APF_RNG_STATE_KEY = "rng_state"
+FRESH_PROMPT_PASS_METADATA_KEY = "fresh_prompt_passes"
+FRESH_PROMPT_PASS_STOP_REASON = "all_active_prompts_reached_max_fresh_prompt_passes"
 
 
 class DataSource(abc.ABC):
@@ -96,8 +98,103 @@ class RolloutDataSource(DataSource):
             )
             if self.args.rollout_shuffle:
                 self.dataset.shuffle(self.epoch_id)
+            self._assign_prompt_ids()
         else:
             self.dataset = None
+
+    def _assign_prompt_ids(self) -> None:
+        if self.dataset is None:
+            return
+
+        for prompt_id, sample in enumerate(self.dataset.origin_samples):
+            metadata = dict(sample.metadata) if isinstance(sample.metadata, dict) else {}
+            metadata[PROMPT_ID_METADATA_KEY] = prompt_id
+            sample.metadata = metadata
+
+    def _fresh_prompt_pass_early_stop_enabled(self) -> bool:
+        return (
+            self.dataset is not None
+            and self.args.rollout_global_dataset
+            and getattr(self.args, "max_fresh_prompt_passes", None) is not None
+        )
+
+    def _get_fresh_prompt_pass_state(self) -> dict[int, int]:
+        return self.metadata.setdefault(FRESH_PROMPT_PASS_METADATA_KEY, {})
+
+    def _record_fresh_prompt_draw(self, prompt_sample: Sample) -> None:
+        if not self._fresh_prompt_pass_early_stop_enabled():
+            return
+
+        prompt_id = get_scalerl_prompt_id(prompt_sample)
+        state = self._get_fresh_prompt_pass_state()
+        state[prompt_id] = int(state.get(prompt_id, 0)) + 1
+
+    def get_prompt_fresh_pass_count(self, prompt_id: int) -> int:
+        return int(self._get_fresh_prompt_pass_state().get(prompt_id, 0))
+
+    def get_prompt_fresh_pass_counts(self) -> dict[int, int]:
+        if self.dataset is None:
+            return {}
+        return {
+            prompt_id: self.get_prompt_fresh_pass_count(prompt_id)
+            for prompt_id in (get_scalerl_prompt_id(sample) for sample in self.dataset.origin_samples)
+        }
+
+    def get_active_prompt_ids(self) -> list[int]:
+        if self.dataset is None:
+            return []
+        return [get_scalerl_prompt_id(sample) for sample in self.dataset.origin_samples]
+
+    def get_early_stop_status(self) -> dict[str, int | float | bool | str | None]:
+        max_passes = getattr(self.args, "max_fresh_prompt_passes", None)
+        if not self._fresh_prompt_pass_early_stop_enabled() or max_passes is None:
+            return {
+                "should_stop_after_training_batch": False,
+                "reason": None,
+                "active_prompt_count": 0,
+                "min_active_prompt_fresh_passes": 0,
+                "max_active_prompt_fresh_passes": 0,
+                "active_prompt_completion_ratio": 0.0,
+            }
+
+        active_prompt_ids = self.get_active_prompt_ids()
+        active_prompt_count = len(active_prompt_ids)
+        active_prompt_pass_counts = [self.get_prompt_fresh_pass_count(prompt_id) for prompt_id in active_prompt_ids]
+        completed_active_prompt_count = sum(pass_count >= max_passes for pass_count in active_prompt_pass_counts)
+        should_stop = active_prompt_count == 0 or completed_active_prompt_count == active_prompt_count
+
+        if active_prompt_pass_counts:
+            min_active_prompt_fresh_passes = min(active_prompt_pass_counts)
+            max_active_prompt_fresh_passes = max(active_prompt_pass_counts)
+        else:
+            min_active_prompt_fresh_passes = max_passes
+            max_active_prompt_fresh_passes = max_passes
+
+        return {
+            "should_stop_after_training_batch": should_stop,
+            "reason": FRESH_PROMPT_PASS_STOP_REASON if should_stop else None,
+            "active_prompt_count": active_prompt_count,
+            "min_active_prompt_fresh_passes": min_active_prompt_fresh_passes,
+            "max_active_prompt_fresh_passes": max_active_prompt_fresh_passes,
+            "active_prompt_completion_ratio": (
+                completed_active_prompt_count / active_prompt_count if active_prompt_count > 0 else 1.0
+            ),
+        }
+
+    def _build_groups_from_prompt_samples(self, prompt_samples: list[Sample]) -> list[list[Sample]]:
+        groups = []
+        for prompt_sample in prompt_samples:
+            self._record_fresh_prompt_draw(prompt_sample)
+            group = []
+            for _ in range(self.args.n_samples_per_prompt):
+                sample = copy.deepcopy(prompt_sample)
+                sample.group_index = self.sample_group_index
+                sample.index = self.sample_index
+                self.sample_index += 1
+                group.append(sample)
+            self.sample_group_index += 1
+            groups.append(group)
+        return groups
 
     def get_samples(self, num_samples):
         # TODO further improve code
@@ -116,18 +213,7 @@ class RolloutDataSource(DataSource):
         else:
             prompt_samples = [Sample() for _ in range(num_samples)]
 
-        samples = []
-        for prompt_sample in prompt_samples:
-            group = []
-            for _ in range(self.args.n_samples_per_prompt):
-                sample = copy.deepcopy(prompt_sample)
-                sample.group_index = self.sample_group_index
-                sample.index = self.sample_index
-                self.sample_index += 1
-                group.append(sample)
-            self.sample_group_index += 1
-            samples.append(group)
-        return samples
+        return self._build_groups_from_prompt_samples(prompt_samples)
 
     def add_samples(self, samples: list[list[Sample]]):
         raise RuntimeError(f"Cannot add samples to {self.__class__.__name__}. This is a read-only data source.")
@@ -236,16 +322,6 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
     def __init__(self, args):
         super().__init__(args)
         self._apf_random = random.Random(self.args.rollout_seed)
-        self._assign_prompt_ids()
-
-    def _assign_prompt_ids(self) -> None:
-        if self.dataset is None:
-            return
-
-        for prompt_id, sample in enumerate(self.dataset.origin_samples):
-            metadata = dict(sample.metadata) if isinstance(sample.metadata, dict) else {}
-            metadata[PROMPT_ID_METADATA_KEY] = prompt_id
-            sample.metadata = metadata
 
     def _adaptive_prompt_filter_enabled(self) -> bool:
         return (
@@ -292,6 +368,17 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
             threshold=self.args.adaptive_prompt_filter_threshold,
             window_steps=self.args.adaptive_prompt_filter_window_steps,
         )
+
+    def get_active_prompt_ids(self) -> list[int]:
+        if self.dataset is None:
+            return []
+        if not self._adaptive_prompt_filter_enabled():
+            return super().get_active_prompt_ids()
+        return [
+            get_scalerl_prompt_id(sample)
+            for sample in self.dataset.origin_samples
+            if not self.is_prompt_retired(get_scalerl_prompt_id(sample))
+        ]
 
     def record_step_pass_rates(self, prompt_step_pass_rates: dict[int, float]) -> dict[str, float]:
         state = self._get_apf_state()
@@ -377,20 +464,6 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
                 return prompt_sample
             state = self._get_apf_state()
             state[APF_SKIP_DRAW_COUNT_KEY] = int(state.get(APF_SKIP_DRAW_COUNT_KEY, 0)) + 1
-
-    def _build_groups_from_prompt_samples(self, prompt_samples) -> list[list[Sample]]:
-        groups = []
-        for prompt_sample in prompt_samples:
-            group = []
-            for _ in range(self.args.n_samples_per_prompt):
-                sample = copy.deepcopy(prompt_sample)
-                sample.group_index = self.sample_group_index
-                sample.index = self.sample_index
-                self.sample_index += 1
-                group.append(sample)
-            self.sample_group_index += 1
-            groups.append(group)
-        return groups
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         samples = self._get_samples_from_buffer(num_samples)
