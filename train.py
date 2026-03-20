@@ -6,6 +6,11 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
 
 
+def _should_force_final_save(args, rollout_id: int, stop_status: dict | None = None) -> bool:
+    should_stop_after_training_batch = bool((stop_status or {}).get("should_stop_after_training_batch", False))
+    return should_stop_after_training_batch or rollout_id == args.num_rollout - 1
+
+
 def train(args):
     configure_logger()
     # allocate the GPUs
@@ -46,16 +51,19 @@ def train(args):
         else:
             actor_model.clear_memory()
 
-    def save(rollout_id):
+    def save(rollout_id, *, force_sync: bool = False):
+        if args.save is None:
+            return
+        should_force_sync = force_sync or rollout_id == args.num_rollout - 1
         if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
             actor_model.save_model(
                 rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
+                force_sync=should_force_sync,
             )
         if args.use_critic:
             critic_model.save_model(
                 rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
+                force_sync=should_force_sync,
             )
         if args.rollout_global_dataset:
             ray.get(rollout_manager.save.remote(rollout_id))
@@ -67,6 +75,7 @@ def train(args):
             ray.get(rollout_manager.eval.remote(rollout_id))
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        stop_status = ray.get(rollout_manager.get_last_generate_status.remote())
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())
@@ -79,8 +88,15 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
 
+        saved_this_rollout = False
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-            save(rollout_id)
+            save(rollout_id, force_sync=_should_force_final_save(args, rollout_id, stop_status))
+            saved_this_rollout = True
+
+        if stop_status.get("should_stop_after_training_batch"):
+            if not saved_this_rollout:
+                save(rollout_id, force_sync=True)
+            break
 
         offload_train()
         if args.offload_rollout:

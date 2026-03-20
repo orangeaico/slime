@@ -93,6 +93,7 @@ ROLLOUT_ARGS=(
    --reward-key score
 
    --num-rollout 702
+   --max-fresh-prompt-passes 3
    --rollout-batch-size 32
    --num-steps-per-rollout 4
    --over-sampling-batch-size 48

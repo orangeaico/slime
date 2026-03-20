@@ -6,6 +6,11 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
 
 
+def _should_force_final_save(args, rollout_id: int, stop_status: dict | None = None) -> bool:
+    should_stop_after_training_batch = bool((stop_status or {}).get("should_stop_after_training_batch", False))
+    return should_stop_after_training_batch or rollout_id == args.num_rollout - 1
+
+
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
 def train(args):
     assert not args.colocate, "Colocation is not supported for async training."
@@ -27,16 +32,33 @@ def train(args):
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
 
+    def save(rollout_id, *, force_sync: bool = False):
+        if args.save is None:
+            return
+        should_force_sync = force_sync or rollout_id == args.num_rollout - 1
+        if (not args.use_critic) or (rollout_id >= args.num_critic_only_steps):
+            actor_model.save_model(rollout_id, force_sync=should_force_sync)
+        if args.use_critic:
+            critic_model.save_model(rollout_id, force_sync=should_force_sync)
+        if args.rollout_global_dataset:
+            ray.get(rollout_manager.save.remote(rollout_id))
+
     # async train loop.
     rollout_data_next_future = rollout_manager.generate.remote(args.start_rollout_id)
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_data_curr_ref = ray.get(rollout_data_next_future)
+            stop_status = ray.get(rollout_manager.get_last_generate_status.remote())
+        else:
+            rollout_data_curr_ref = None
+            stop_status = {}
 
         # Start the next rollout early.
-        if rollout_id + 1 < args.num_rollout:
+        if (not stop_status.get("should_stop_after_training_batch")) and rollout_id + 1 < args.num_rollout:
             rollout_data_next_future = rollout_manager.generate.remote(rollout_id + 1)
+        else:
+            rollout_data_next_future = None
 
         if args.use_critic:
             critic_train_handle = critic_model.async_train(rollout_id, rollout_data_curr_ref)
@@ -46,18 +68,15 @@ def train(args):
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
 
+        saved_this_rollout = False
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-            actor_model.save_model(
-                rollout_id,
-                force_sync=rollout_id == args.num_rollout - 1,
-            )
-            if args.use_critic:
-                critic_model.save_model(
-                    rollout_id,
-                    force_sync=rollout_id == args.num_rollout - 1,
-                )
-            if args.rollout_global_dataset:
-                ray.get(rollout_manager.save.remote(rollout_id))
+            save(rollout_id, force_sync=_should_force_final_save(args, rollout_id, stop_status))
+            saved_this_rollout = True
+
+        if stop_status.get("should_stop_after_training_batch"):
+            if not saved_this_rollout:
+                save(rollout_id, force_sync=True)
+            break
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
             # sync generate before update weights to prevent update weight in the middle of generation
