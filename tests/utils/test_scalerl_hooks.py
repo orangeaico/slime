@@ -15,6 +15,7 @@ from slime.rollout.scalerl import (
     post_process_rewards_with_dapo_style,
     update_step_window_adaptive_prompt_filter,
 )
+from slime.utils.scalerl_utils import apply_group_relative_focal_weights_to_rewards
 from slime.utils.types import Sample
 
 
@@ -62,6 +63,7 @@ def _make_args(tmp_path, **overrides):
         rewards_normalization=False,
         batch_level_normalization=False,
         grpo_std_normalization=False,
+        group_relative_focal_gamma=None,
         save=str(tmp_path / "save"),
         load=None,
     )
@@ -306,6 +308,27 @@ def test_dapo_style_dynamic_filter_and_reward_post_process(tmp_path):
     rollout_metrics = compute_scalerl_metrics_from_samples(args, varied_length_group)
     assert rollout_metrics["scalerl/penalty_delta_mean"] == pytest.approx(-0.25)
     assert rollout_metrics["scalerl/penalized_sample_frac"] == pytest.approx(0.5)
+
+
+def test_group_relative_focal_weighting_uses_raw_binary_rewards_for_dapo_style(tmp_path):
+    args = _make_args(tmp_path)
+    varied_length_group = [
+        _make_reward_sample(prompt_id=0, group_index=0, reward=1.0, response_length=8, index=0),
+        _make_reward_sample(prompt_id=0, group_index=0, reward=1.0, response_length=10, index=1),
+    ]
+
+    raw_rewards, shaped_rewards = post_process_rewards_with_dapo_style(args, varied_length_group)
+    weighted_rewards = apply_group_relative_focal_weights_to_rewards(
+        normalized_rewards=shaped_rewards,
+        raw_rewards=raw_rewards,
+        group_indices=[0, 0],
+        gamma=1.0,
+        active_mask=[True, True],
+    )
+
+    assert raw_rewards == pytest.approx([1.0, 1.0])
+    assert shaped_rewards == pytest.approx([1.0, 0.0])
+    assert weighted_rewards == pytest.approx([0.0, 0.0])
 
 
 def test_truncated_samples_can_be_marked_inactive_and_ignored_in_post_filter_metrics(tmp_path):

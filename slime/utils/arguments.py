@@ -937,6 +937,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
+                "--group-relative-focal-gamma",
+                type=float,
+                default=None,
+                help=(
+                    "Optional F-GRPO-style focal exponent. When set, scale each prompt group's normalized "
+                    "group-relative rewards by (1 - X/N)^gamma, where X/N is the empirical binary success rate."
+                ),
+            )
+            parser.add_argument(
                 "--batch-level-normalization",
                 action="store_true",
                 default=False,
