@@ -169,6 +169,82 @@ def should_discard_prompt(
     return len(step_pass_rates) == window_steps and all(rate >= threshold for rate in step_pass_rates)
 
 
+def _get_binary_correctness_mask(
+    raw_rewards: Sequence[float],
+    *,
+    active_mask: Sequence[bool] | None = None,
+) -> list[bool]:
+    resolved_active_mask = _resolve_active_mask(active_mask, length=len(raw_rewards))
+    active_rewards = {float(reward) for reward, is_active in zip(raw_rewards, resolved_active_mask, strict=True) if is_active}
+    if not active_rewards:
+        return [False] * len(raw_rewards)
+
+    if not (active_rewards.issubset({0.0, 1.0}) or active_rewards.issubset({-1.0, 1.0})):
+        raise ValueError(
+            "Group-relative focal weighting requires binary raw rewards encoded as {0, 1} or {-1, 1}."
+        )
+
+    return [
+        bool(float(reward) > 0.0) if is_active else False
+        for reward, is_active in zip(raw_rewards, resolved_active_mask, strict=True)
+    ]
+
+
+def get_group_relative_focal_weights(
+    raw_rewards: Sequence[float],
+    group_indices: Sequence[int],
+    gamma: float,
+    *,
+    active_mask: Sequence[bool] | None = None,
+) -> list[float]:
+    if gamma < 0:
+        raise ValueError("group_relative_focal_gamma must be non-negative.")
+
+    resolved_active_mask = _resolve_active_mask(active_mask, length=len(raw_rewards))
+    correctness_mask = _get_binary_correctness_mask(raw_rewards, active_mask=resolved_active_mask)
+
+    group_totals: dict[int, int] = {}
+    group_successes: dict[int, int] = {}
+    for group_index, is_correct, is_active in zip(group_indices, correctness_mask, resolved_active_mask, strict=True):
+        if not is_active:
+            continue
+        group_totals[group_index] = group_totals.get(group_index, 0) + 1
+        group_successes[group_index] = group_successes.get(group_index, 0) + int(is_correct)
+
+    group_weights = {
+        group_index: (1.0 - (group_successes[group_index] / total)) ** gamma
+        for group_index, total in group_totals.items()
+    }
+    return [group_weights.get(group_index, 1.0) for group_index in group_indices]
+
+
+def apply_group_relative_focal_weights_to_rewards(
+    normalized_rewards: Sequence[float],
+    raw_rewards: Sequence[float],
+    group_indices: Sequence[int],
+    gamma: float | None,
+    *,
+    active_mask: Sequence[bool] | None = None,
+) -> list[float]:
+    resolved_active_mask = _resolve_active_mask(active_mask, length=len(normalized_rewards))
+    if gamma is None:
+        return [
+            float(reward) if is_active else 0.0
+            for reward, is_active in zip(normalized_rewards, resolved_active_mask, strict=True)
+        ]
+
+    focal_weights = get_group_relative_focal_weights(
+        raw_rewards,
+        group_indices,
+        gamma,
+        active_mask=resolved_active_mask,
+    )
+    return [
+        float(reward) * weight if is_active else 0.0
+        for reward, weight, is_active in zip(normalized_rewards, focal_weights, resolved_active_mask, strict=True)
+    ]
+
+
 def normalize_rewards_for_training(
     args,
     raw_rewards: Sequence[float],
@@ -240,6 +316,7 @@ def validate_scalerl_args(args) -> None:
     apf_threshold = getattr(args, "adaptive_prompt_filter_threshold", None)
     apf_window_steps = getattr(args, "adaptive_prompt_filter_window_steps", None)
     apf_drop_prob = getattr(args, "adaptive_prompt_filter_drop_prob", 1.0)
+    group_relative_focal_gamma = getattr(args, "group_relative_focal_gamma", None)
 
     if length_penalty_type == "dapo_style":
         if length_penalty_cache_len is None or length_penalty_cache_len <= 0:
@@ -257,6 +334,8 @@ def validate_scalerl_args(args) -> None:
         raise ValueError("--adaptive-prompt-filter-window-steps must be positive.")
     if not (0.0 <= apf_drop_prob <= 1.0):
         raise ValueError("--adaptive-prompt-filter-drop-prob must be between 0 and 1.")
+    if group_relative_focal_gamma is not None and group_relative_focal_gamma < 0:
+        raise ValueError("--group-relative-focal-gamma must be non-negative when provided.")
 
     if args.batch_level_normalization:
         if args.advantage_estimator not in ["grpo", "gspo"]:

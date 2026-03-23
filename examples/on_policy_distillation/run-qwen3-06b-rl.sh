@@ -155,6 +155,7 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    ${LOSS_ARGS[@]}
+--group-relative-focal-gamma 0.5
    --batch-level-normalization
    --prompt-level-loss-aggregation
    --kl-loss-coef 0.00

@@ -24,6 +24,7 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.scalerl_utils import (
+    apply_group_relative_focal_weights_to_rewards,
     get_batch_normalized_prompt_rewards,
     get_prompt_group_indices,
     get_prompt_group_mean_centered_rewards,
@@ -592,71 +593,82 @@ class RolloutManager:
             torch.save(dict(rollout_id=rollout_id, **dump_data), path)
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
-        if self.custom_reward_post_process_func is not None:
-            raw_rewards, normalized_rewards = self.custom_reward_post_process_func(self.args, samples)
-            active_mask = [not sample.remove_sample for sample in samples]
-            normalized_rewards = [
-                reward if is_active else 0.0
-                for reward, is_active in zip(normalized_rewards, active_mask, strict=True)
-            ]
-            return raw_rewards, normalized_rewards
-
-        raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
         group_indices = _get_sample_group_indices(samples, self.args.n_samples_per_prompt)
         active_mask = [not sample.remove_sample for sample in samples]
-        active_raw_rewards = [reward for reward, is_active in zip(raw_rewards, active_mask, strict=True) if is_active]
-        logger.info(f"[DEBUG] Raw rewards (extracted from samples): {raw_rewards}")
-        if active_raw_rewards:
-            logger.info(
-                "[DEBUG] Active raw rewards stats: "
-                f"min={min(active_raw_rewards)}, max={max(active_raw_rewards)}, "
-                f"mean={sum(active_raw_rewards)/len(active_raw_rewards)}"
-            )
+
+        if self.custom_reward_post_process_func is not None:
+            raw_rewards, normalized_rewards = self.custom_reward_post_process_func(self.args, samples)
         else:
-            logger.info("[DEBUG] No active samples remain for reward normalization.")
-
-        if (
-            self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
-            and self.args.rewards_normalization
-        ):
-            centered_rewards = get_prompt_group_mean_centered_rewards(raw_rewards, group_indices, active_mask=active_mask)
-            logger.info(f"[DEBUG] Mean-centered rewards by group: {centered_rewards}")
-
-            if self.args.batch_level_normalization:
-                normalized_rewards = get_batch_normalized_prompt_rewards(
-                    raw_rewards,
-                    group_indices,
-                    active_mask=active_mask,
+            raw_rewards = [sample.get_reward_value(self.args) for sample in samples]
+            active_raw_rewards = [reward for reward, is_active in zip(raw_rewards, active_mask, strict=True) if is_active]
+            logger.info(f"[DEBUG] Raw rewards (extracted from samples): {raw_rewards}")
+            if active_raw_rewards:
+                logger.info(
+                    "[DEBUG] Active raw rewards stats: "
+                    f"min={min(active_raw_rewards)}, max={max(active_raw_rewards)}, "
+                    f"mean={sum(active_raw_rewards)/len(active_raw_rewards)}"
                 )
-                logger.info(f"[DEBUG] Rewards after batch-level normalization: {normalized_rewards}")
             else:
+                logger.info("[DEBUG] No active samples remain for reward normalization.")
+
+            if (
+                self.args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+                and self.args.rewards_normalization
+            ):
+                centered_rewards = get_prompt_group_mean_centered_rewards(
+                    raw_rewards, group_indices, active_mask=active_mask
+                )
+                logger.info(f"[DEBUG] Mean-centered rewards by group: {centered_rewards}")
+
+                if self.args.batch_level_normalization:
+                    normalized_rewards = get_batch_normalized_prompt_rewards(
+                        raw_rewards,
+                        group_indices,
+                        active_mask=active_mask,
+                    )
+                    logger.info(f"[DEBUG] Rewards after batch-level normalization: {normalized_rewards}")
+                else:
+                    normalized_rewards = normalize_rewards_for_training(
+                        self.args,
+                        raw_rewards,
+                        group_indices,
+                        active_mask=active_mask,
+                    )
+                    if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
+                        logger.info(f"[DEBUG] Rewards after prompt-level std division: {normalized_rewards}")
+                    else:
+                        logger.info(
+                            f"[DEBUG] Skipping std normalization "
+                            f"(batch_level_normalization={self.args.batch_level_normalization}, "
+                            f"grpo_std_normalization={self.args.grpo_std_normalization})"
+                        )
+            else:
+                logger.info(
+                    f"[DEBUG] Skipping reward normalization (rewards_normalization={self.args.rewards_normalization})"
+                )
                 normalized_rewards = normalize_rewards_for_training(
                     self.args,
                     raw_rewards,
                     group_indices,
                     active_mask=active_mask,
                 )
-                if self.args.advantage_estimator in ["grpo", "gspo"] and self.args.grpo_std_normalization:
-                    logger.info(f"[DEBUG] Rewards after prompt-level std division: {normalized_rewards}")
-                else:
-                    logger.info(
-                        f"[DEBUG] Skipping std normalization "
-                        f"(batch_level_normalization={self.args.batch_level_normalization}, "
-                        f"grpo_std_normalization={self.args.grpo_std_normalization})"
-                    )
 
-            logger.info(
-                f"[DEBUG] Sum of normalized rewards: {sum(normalized_rewards)}, Mean: {sum(normalized_rewards)/len(normalized_rewards)}"
-            )
-            return raw_rewards, normalized_rewards
-
-        logger.info(f"[DEBUG] Skipping reward normalization (rewards_normalization={self.args.rewards_normalization})")
-        return raw_rewards, normalize_rewards_for_training(
-            self.args,
+        normalized_rewards = [
+            reward if is_active else 0.0
+            for reward, is_active in zip(normalized_rewards, active_mask, strict=True)
+        ]
+        normalized_rewards = apply_group_relative_focal_weights_to_rewards(
+            normalized_rewards,
             raw_rewards,
             group_indices,
+            getattr(self.args, "group_relative_focal_gamma", None),
             active_mask=active_mask,
         )
+        logger.info(
+            f"[DEBUG] Sum of normalized rewards after focal scaling: {sum(normalized_rewards)}, "
+            f"Mean: {sum(normalized_rewards)/len(normalized_rewards)}"
+        )
+        return raw_rewards, normalized_rewards
 
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """

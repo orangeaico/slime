@@ -4,9 +4,11 @@ import pytest
 import torch
 
 from slime.utils.scalerl_utils import (
+    apply_group_relative_focal_weights_to_rewards,
     apply_length_penalty,
     compute_dapo_style_length_penalty,
     get_batch_normalized_prompt_rewards,
+    get_group_relative_focal_weights,
     get_prompt_group_mean_centered_rewards,
     get_prompt_loss_token_weights,
     get_required_prompt_group_multiple,
@@ -127,6 +129,96 @@ def test_normalize_rewards_for_training_zeros_inactive_samples_without_reward_no
     )
 
     assert rewards == pytest.approx([1.0, 0.0, 3.0])
+
+
+def test_group_relative_focal_weights_match_zero_one_groups():
+    weights = get_group_relative_focal_weights(
+        raw_rewards=[1.0, 0.0, 1.0, 1.0],
+        group_indices=[0, 0, 1, 1],
+        gamma=1.0,
+    )
+
+    assert weights == pytest.approx([0.5, 0.5, 0.0, 0.0])
+
+
+def test_group_relative_focal_weights_match_signed_reward_groups():
+    weights = get_group_relative_focal_weights(
+        raw_rewards=[1.0, -1.0, 1.0, -1.0],
+        group_indices=[0, 0, 1, 1],
+        gamma=2.0,
+    )
+
+    assert weights == pytest.approx([0.25, 0.25, 0.25, 0.25])
+
+
+def test_group_relative_focal_weights_cover_all_correct_and_all_incorrect_groups():
+    all_correct_weights = get_group_relative_focal_weights(
+        raw_rewards=[1.0, 1.0],
+        group_indices=[0, 0],
+        gamma=1.0,
+    )
+    all_incorrect_weights = get_group_relative_focal_weights(
+        raw_rewards=[0.0, 0.0],
+        group_indices=[0, 0],
+        gamma=1.0,
+    )
+
+    assert all_correct_weights == pytest.approx([0.0, 0.0])
+    assert all_incorrect_weights == pytest.approx([1.0, 1.0])
+
+
+def test_group_relative_focal_weights_ignore_inactive_samples():
+    weights = get_group_relative_focal_weights(
+        raw_rewards=[1.0, 1.0, -1.0],
+        group_indices=[0, 0, 0],
+        gamma=1.0,
+        active_mask=[True, False, True],
+    )
+
+    assert weights == pytest.approx([0.5, 0.5, 0.5])
+
+
+def test_apply_group_relative_focal_weights_gamma_zero_is_noop():
+    scaled_rewards = apply_group_relative_focal_weights_to_rewards(
+        normalized_rewards=[2.0, -2.0, 0.0],
+        raw_rewards=[1.0, -1.0, 1.0],
+        group_indices=[0, 0, 1],
+        gamma=0.0,
+        active_mask=[True, True, False],
+    )
+
+    assert scaled_rewards == pytest.approx([2.0, -2.0, 0.0])
+
+
+def test_apply_group_relative_focal_weights_none_is_noop():
+    scaled_rewards = apply_group_relative_focal_weights_to_rewards(
+        normalized_rewards=[0.5, -0.5],
+        raw_rewards=[1.0, 0.0],
+        group_indices=[0, 0],
+        gamma=None,
+    )
+
+    assert scaled_rewards == pytest.approx([0.5, -0.5])
+
+
+def test_apply_group_relative_focal_weights_scales_normalized_rewards():
+    scaled_rewards = apply_group_relative_focal_weights_to_rewards(
+        normalized_rewards=[2.0, -2.0, 1.0, -1.0],
+        raw_rewards=[1.0, 0.0, 1.0, 1.0],
+        group_indices=[0, 0, 1, 1],
+        gamma=1.0,
+    )
+
+    assert scaled_rewards == pytest.approx([1.0, -1.0, 0.0, 0.0])
+
+
+def test_group_relative_focal_weights_reject_non_binary_rewards():
+    with pytest.raises(ValueError, match="binary raw rewards"):
+        get_group_relative_focal_weights(
+            raw_rewards=[1.0, 0.5],
+            group_indices=[0, 0],
+            gamma=1.0,
+        )
 
 
 def test_required_prompt_group_multiple_uses_lcm():
@@ -287,3 +379,21 @@ def test_validate_scalerl_args_rejects_invalid_length_penalty_and_apf_configs():
         validate_scalerl_args(
             SimpleNamespace(**(base_args | dict(adaptive_prompt_filter_threshold=1.1, adaptive_prompt_filter_window_steps=4)))
         )
+
+
+def test_validate_scalerl_args_rejects_negative_group_relative_focal_gamma():
+    base_args = dict(
+        batch_level_normalization=False,
+        prompt_level_loss_aggregation=False,
+        advantage_estimator="grpo",
+        normalize_advantages=False,
+        rewards_normalization=True,
+        train_backend="megatron",
+        custom_pg_loss_reducer_function_path=None,
+        loss_type="policy_loss",
+        global_batch_size=64,
+        n_samples_per_prompt=8,
+    )
+
+    with pytest.raises(ValueError, match="group-relative-focal-gamma"):
+        validate_scalerl_args(SimpleNamespace(**(base_args | dict(group_relative_focal_gamma=-0.1))))
