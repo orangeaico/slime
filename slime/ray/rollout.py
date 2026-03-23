@@ -49,7 +49,6 @@ def _default_early_stop_status() -> dict[str, Any]:
         "reason": None,
         "max_fresh_prompt_passes": None,
         "active_prompt_count": 0,
-        "completed_active_prompt_count": 0,
         "min_active_prompt_fresh_passes": 0,
         "max_active_prompt_fresh_passes": 0,
         "active_prompt_completion_ratio": 0.0,
