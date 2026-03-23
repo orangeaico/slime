@@ -393,7 +393,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--adaptive-prompt-filter-drop-prob",
                 type=float,
                 default=1.0,
-                help="Probability of dropping a prompt draw once it satisfies the adaptive prompt filter condition.",
+                help=(
+                    "Probability of retiring a prompt when it first satisfies the adaptive prompt filter condition "
+                    "on a rollout. Retired prompts remain retired."
+                ),
             )
 
             # partial rollout

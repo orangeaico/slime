@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 import slime.rollout.data_source as rollout_data_source_module
-from slime.rollout.data_source import ScaleRLRolloutDataSourceWithBuffer
+from slime.rollout.data_source import APF_RETIRED_PROMPT_IDS_KEY, ScaleRLRolloutDataSourceWithBuffer
 from slime.rollout.filter_hub.dynamic_sampling_filters import check_reward_nonzero_std_with_dapo_style
 from slime.rollout.filter_hub.sample_filters import mark_truncated_samples_inactive
 from slime.rollout.scalerl import (
@@ -94,7 +94,7 @@ def patched_dataset(monkeypatch):
     return dataset
 
 
-def test_custom_data_source_assigns_prompt_ids_and_skips_retired_prompts(tmp_path, patched_dataset):
+def test_custom_data_source_assigns_prompt_ids_and_skips_sticky_retired_prompts(tmp_path, patched_dataset):
     args = _make_args(tmp_path)
     data_source = ScaleRLRolloutDataSourceWithBuffer(args)
 
@@ -103,15 +103,16 @@ def test_custom_data_source_assigns_prompt_ids_and_skips_retired_prompts(tmp_pat
     first_metrics = data_source.record_step_pass_rates({0: 1.0})
     second_metrics = data_source.record_step_pass_rates({0: 1.0})
     assert first_metrics["newly_retired_prompt_count"] == pytest.approx(0.0)
+    assert first_metrics["retirement_candidate_prompt_count"] == pytest.approx(0.0)
+    assert first_metrics["retirement_deferred_prompt_count"] == pytest.approx(0.0)
     assert second_metrics["newly_retired_prompt_count"] == pytest.approx(1.0)
+    assert second_metrics["retirement_candidate_prompt_count"] == pytest.approx(1.0)
+    assert second_metrics["retirement_deferred_prompt_count"] == pytest.approx(0.0)
     assert second_metrics["retired_prompt_frac"] == pytest.approx(1.0 / 3.0)
 
-    groups = data_source.get_samples(1)
-    sampled_prompt_id = groups[0][0].metadata[PROMPT_ID_METADATA_KEY]
-    assert sampled_prompt_id != 0
-    skipped_metrics = data_source.record_step_pass_rates({})
-    assert skipped_metrics["skip_prompt_draw_count"] == pytest.approx(1.0)
-    assert skipped_metrics["kept_retired_prompt_draw_count"] == pytest.approx(0.0)
+    groups = data_source.get_samples(2)
+    sampled_prompt_ids = {group[0].metadata[PROMPT_ID_METADATA_KEY] for group in groups}
+    assert sampled_prompt_ids == {1, 2}
 
 
 def test_fresh_prompt_passes_increment_only_for_fresh_dataset_draws(tmp_path, patched_dataset):
@@ -136,13 +137,13 @@ def test_early_stop_status_uses_only_active_prompts(tmp_path, patched_dataset):
     initial_status = data_source.get_early_stop_status()
     assert initial_status["should_stop_after_training_batch"] is False
     assert initial_status["active_prompt_count"] == 3
-    assert initial_status["completed_active_prompt_count"] == 2
+    assert initial_status["active_prompt_completion_ratio"] == pytest.approx(2.0 / 3.0)
 
     data_source.record_step_pass_rates({2: 1.0})
     stop_status = data_source.get_early_stop_status()
     assert stop_status["should_stop_after_training_batch"] is True
     assert stop_status["active_prompt_count"] == 2
-    assert stop_status["completed_active_prompt_count"] == 2
+    assert stop_status["active_prompt_completion_ratio"] == pytest.approx(1.0)
     assert stop_status["reason"] is not None
 
 
@@ -159,11 +160,24 @@ def test_custom_data_source_raises_when_no_eligible_prompts_remain(tmp_path, pat
         data_source.get_samples(1)
 
 
-def test_probabilistic_apf_drop_can_keep_or_skip_retired_prompts(tmp_path, patched_dataset):
-    args = _make_args(tmp_path, adaptive_prompt_filter_drop_prob=0.5)
+def test_sticky_retirement_does_not_unretire_when_window_drops(tmp_path, patched_dataset):
+    args = _make_args(tmp_path)
     data_source = ScaleRLRolloutDataSourceWithBuffer(args)
     data_source.record_step_pass_rates({0: 1.0})
     data_source.record_step_pass_rates({0: 1.0})
+    assert data_source.is_prompt_retired(0)
+    assert 0 not in data_source.get_active_prompt_ids()
+
+    # Even if a later sampled window value is below threshold, retirement remains sticky.
+    sticky_metrics = data_source.record_step_pass_rates({0: 0.0})
+    assert sticky_metrics["newly_retired_prompt_count"] == pytest.approx(0.0)
+    assert data_source.is_prompt_retired(0)
+    assert 0 not in data_source.get_active_prompt_ids()
+
+
+def test_probabilistic_apf_retirement_can_defer_then_retire(tmp_path, patched_dataset):
+    args = _make_args(tmp_path, adaptive_prompt_filter_drop_prob=0.5)
+    data_source = ScaleRLRolloutDataSourceWithBuffer(args)
 
     class FakeRandom:
         def __init__(self, values):
@@ -181,45 +195,22 @@ def test_probabilistic_apf_drop_can_keep_or_skip_retired_prompts(tmp_path, patch
     data_source._apf_random = FakeRandom([0.6, 0.2])
     data_source._store_apf_rng_state()
 
-    groups = data_source.get_samples(1)
-    assert groups[0][0].metadata[PROMPT_ID_METADATA_KEY] == 0
+    data_source.record_step_pass_rates({0: 1.0})
+    deferred_metrics = data_source.record_step_pass_rates({0: 1.0})
+    assert deferred_metrics["retirement_candidate_prompt_count"] == pytest.approx(1.0)
+    assert deferred_metrics["retirement_deferred_prompt_count"] == pytest.approx(1.0)
+    assert deferred_metrics["newly_retired_prompt_count"] == pytest.approx(0.0)
+    assert data_source.is_prompt_retired(0) is False
+
+    retired_metrics = data_source.record_step_pass_rates({0: 1.0})
+    assert retired_metrics["retirement_candidate_prompt_count"] == pytest.approx(1.0)
+    assert retired_metrics["retirement_deferred_prompt_count"] == pytest.approx(0.0)
+    assert retired_metrics["newly_retired_prompt_count"] == pytest.approx(1.0)
+    assert data_source.is_prompt_retired(0) is True
 
     data_source.sample_offset = 0
     groups = data_source.get_samples(1)
-    assert groups[0][0].metadata[PROMPT_ID_METADATA_KEY] == 1
-
-    skipped_metrics = data_source.record_step_pass_rates({})
-    assert skipped_metrics["skip_prompt_draw_count"] == pytest.approx(1.0)
-    assert skipped_metrics["kept_retired_prompt_draw_count"] == pytest.approx(1.0)
-
-
-def test_probabilistic_apf_avoids_false_dataset_exhaustion(tmp_path, patched_dataset):
-    args = _make_args(tmp_path, adaptive_prompt_filter_drop_prob=0.5)
-    data_source = ScaleRLRolloutDataSourceWithBuffer(args)
-
-    for prompt_id in [0, 1, 2]:
-        data_source.record_step_pass_rates({prompt_id: 1.0})
-    for prompt_id in [0, 1, 2]:
-        data_source.record_step_pass_rates({prompt_id: 1.0})
-
-    class FakeRandom:
-        def random(self):
-            return 0.9
-
-        def getstate(self):
-            return ()
-
-        def setstate(self, state):
-            return None
-
-    data_source._apf_random = FakeRandom()
-    data_source._store_apf_rng_state()
-
-    groups = data_source.get_samples(1)
-    assert len(groups) == 1
-    kept_metrics = data_source.record_step_pass_rates({})
-    assert kept_metrics["skip_prompt_draw_count"] == pytest.approx(0.0)
-    assert kept_metrics["kept_retired_prompt_draw_count"] == pytest.approx(1.0)
+    assert groups[0][0].metadata[PROMPT_ID_METADATA_KEY] != 0
 
 
 def test_update_step_window_apf_aggregates_multiple_groups_per_prompt(tmp_path, patched_dataset):
@@ -249,8 +240,8 @@ def test_update_step_window_apf_aggregates_multiple_groups_per_prompt(tmp_path, 
     rollout_metrics = all_samples[0][0].metadata[SCALERL_ROLLOUT_METRICS_METADATA_KEY]
     assert rollout_metrics["retired_prompt_frac"] == pytest.approx(0.0)
     assert rollout_metrics["newly_retired_prompt_count"] == pytest.approx(0.0)
-    assert rollout_metrics["skip_prompt_draw_count"] == pytest.approx(0.0)
-    assert rollout_metrics["kept_retired_prompt_draw_count"] == pytest.approx(0.0)
+    assert rollout_metrics["retirement_candidate_prompt_count"] == pytest.approx(0.0)
+    assert rollout_metrics["retirement_deferred_prompt_count"] == pytest.approx(0.0)
 
 
 def test_apf_state_survives_save_and_load(tmp_path, patched_dataset):
@@ -266,10 +257,31 @@ def test_apf_state_survives_save_and_load(tmp_path, patched_dataset):
     reloaded_data_source.load(3)
 
     assert reloaded_data_source.metadata[APF_METADATA_KEY][APF_STEP_PASS_RATES_KEY] == data_source.metadata[APF_METADATA_KEY][APF_STEP_PASS_RATES_KEY]
+    assert reloaded_data_source.metadata[APF_METADATA_KEY][APF_RETIRED_PROMPT_IDS_KEY] == data_source.metadata[APF_METADATA_KEY][APF_RETIRED_PROMPT_IDS_KEY]
     assert reloaded_data_source.get_prompt_step_pass_rates(0) == pytest.approx([1.0, 1.0])
     assert reloaded_data_source.get_prompt_step_pass_rates(1) == pytest.approx([0.5])
+    assert reloaded_data_source.is_prompt_retired(0) is True
     assert reloaded_data_source.get_prompt_fresh_pass_count(0) == 1
     assert reloaded_data_source.get_prompt_fresh_pass_count(1) == 1
+
+
+def test_apf_load_defaults_sticky_retired_state_for_legacy_metadata(tmp_path, patched_dataset):
+    args = _make_args(tmp_path, max_fresh_prompt_passes=2)
+    data_source = ScaleRLRolloutDataSourceWithBuffer(args)
+    data_source.record_step_pass_rates({0: 1.0})
+    data_source.save(1)
+
+    legacy_path = tmp_path / "save" / "rollout" / "global_dataset_state_dict_1.pt"
+    state_dict = rollout_data_source_module.torch.load(legacy_path)
+    state_dict["metadata"][APF_METADATA_KEY].pop(APF_RETIRED_PROMPT_IDS_KEY, None)
+    rollout_data_source_module.torch.save(state_dict, legacy_path)
+
+    reloaded_args = _make_args(tmp_path, load=args.save)
+    reloaded_data_source = ScaleRLRolloutDataSourceWithBuffer(reloaded_args)
+    reloaded_data_source.load(1)
+
+    assert reloaded_data_source.metadata[APF_METADATA_KEY][APF_RETIRED_PROMPT_IDS_KEY] == []
+    assert reloaded_data_source.is_prompt_retired(0) is False
 
 
 def test_dapo_style_dynamic_filter_and_reward_post_process(tmp_path):

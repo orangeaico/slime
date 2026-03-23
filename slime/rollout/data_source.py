@@ -21,9 +21,8 @@ from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
-APF_SKIP_DRAW_COUNT_KEY = "skip_prompt_draw_count"
-APF_KEEP_DRAW_COUNT_KEY = "kept_retired_prompt_draw_count"
 APF_RNG_STATE_KEY = "rng_state"
+APF_RETIRED_PROMPT_IDS_KEY = "retired_prompt_ids"
 FRESH_PROMPT_PASS_METADATA_KEY = "fresh_prompt_passes"
 FRESH_PROMPT_PASS_STOP_REASON = "all_active_prompts_reached_max_fresh_prompt_passes"
 
@@ -329,11 +328,13 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
             and getattr(self.args, "adaptive_prompt_filter_window_steps", None) is not None
         )
 
-    def _get_apf_state(self) -> dict[str, dict[int, list[float]]]:
+    def _get_apf_state(self) -> dict[str, object]:
         state = self.metadata.setdefault(APF_METADATA_KEY, {})
+        if not isinstance(state, dict):
+            state = {}
+            self.metadata[APF_METADATA_KEY] = state
         state.setdefault(APF_STEP_PASS_RATES_KEY, {})
-        state.setdefault(APF_SKIP_DRAW_COUNT_KEY, 0)
-        state.setdefault(APF_KEEP_DRAW_COUNT_KEY, 0)
+        state.setdefault(APF_RETIRED_PROMPT_IDS_KEY, [])
         state.setdefault(APF_RNG_STATE_KEY, self._apf_random.getstate())
         return state
 
@@ -344,6 +345,22 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
         state = self._get_apf_state()
         state[APF_RNG_STATE_KEY] = self._apf_random.getstate()
 
+    def _get_apf_retired_prompt_ids(self, state: dict[str, object] | None = None) -> set[int]:
+        state = self._get_apf_state() if state is None else state
+        raw_prompt_ids = state.get(APF_RETIRED_PROMPT_IDS_KEY, [])
+        if isinstance(raw_prompt_ids, set):
+            prompt_ids = {int(prompt_id) for prompt_id in raw_prompt_ids}
+        elif isinstance(raw_prompt_ids, list | tuple):
+            prompt_ids = {int(prompt_id) for prompt_id in raw_prompt_ids}
+        else:
+            prompt_ids = set()
+        state[APF_RETIRED_PROMPT_IDS_KEY] = sorted(prompt_ids)
+        return prompt_ids
+
+    def _set_apf_retired_prompt_ids(self, prompt_ids: set[int], state: dict[str, object] | None = None) -> None:
+        state = self._get_apf_state() if state is None else state
+        state[APF_RETIRED_PROMPT_IDS_KEY] = sorted({int(prompt_id) for prompt_id in prompt_ids})
+
     def load(self, rollout_id=None):
         super().load(rollout_id)
         if not self._adaptive_prompt_filter_enabled():
@@ -353,21 +370,19 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
         rng_state = state.get(APF_RNG_STATE_KEY)
         if rng_state is not None:
             self._apf_random.setstate(rng_state)
+        self._set_apf_retired_prompt_ids(self._get_apf_retired_prompt_ids(state), state=state)
 
     def get_prompt_step_pass_rates(self, prompt_id: int) -> list[float]:
         state = self._get_apf_state()
         prompt_step_pass_rates = state[APF_STEP_PASS_RATES_KEY]
+        assert isinstance(prompt_step_pass_rates, dict)
         return list(prompt_step_pass_rates.get(prompt_id, []))
 
     def is_prompt_retired(self, prompt_id: int) -> bool:
         if not self._adaptive_prompt_filter_enabled():
             return False
 
-        return should_discard_prompt(
-            self.get_prompt_step_pass_rates(prompt_id),
-            threshold=self.args.adaptive_prompt_filter_threshold,
-            window_steps=self.args.adaptive_prompt_filter_window_steps,
-        )
+        return int(prompt_id) in self._get_apf_retired_prompt_ids()
 
     def get_active_prompt_ids(self) -> list[int]:
         if self.dataset is None:
@@ -383,16 +398,17 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
     def record_step_pass_rates(self, prompt_step_pass_rates: dict[int, float]) -> dict[str, float]:
         state = self._get_apf_state()
         if not self._adaptive_prompt_filter_enabled():
-            metrics = {
-                "skip_prompt_draw_count": float(state.get(APF_SKIP_DRAW_COUNT_KEY, 0)),
-                "kept_retired_prompt_draw_count": float(state.get(APF_KEEP_DRAW_COUNT_KEY, 0)),
+            return {
+                "retired_prompt_frac": 0.0,
+                "newly_retired_prompt_count": 0.0,
+                "retirement_candidate_prompt_count": 0.0,
+                "retirement_deferred_prompt_count": 0.0,
             }
-            state[APF_SKIP_DRAW_COUNT_KEY] = 0
-            state[APF_KEEP_DRAW_COUNT_KEY] = 0
-            return metrics
 
         windows = state[APF_STEP_PASS_RATES_KEY]
-        previous_retired = {prompt_id for prompt_id in windows if self.is_prompt_retired(prompt_id)}
+        assert isinstance(windows, dict)
+        previous_retired_prompt_ids = self._get_apf_retired_prompt_ids(state)
+        retirement_candidate_prompt_ids = set()
         for prompt_id, step_pass_rate in prompt_step_pass_rates.items():
             current_window = windows.get(prompt_id, [])
             windows[prompt_id] = update_step_pass_rate_window(
@@ -400,41 +416,43 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
                 step_pass_rate,
                 window_steps=self.args.adaptive_prompt_filter_window_steps,
             )
+            if prompt_id in previous_retired_prompt_ids:
+                continue
+            if should_discard_prompt(
+                windows[prompt_id],
+                threshold=self.args.adaptive_prompt_filter_threshold,
+                window_steps=self.args.adaptive_prompt_filter_window_steps,
+            ):
+                retirement_candidate_prompt_ids.add(prompt_id)
 
-        retired_prompt_ids = {prompt_id for prompt_id in windows if self.is_prompt_retired(prompt_id)}
+        newly_retired_prompt_ids = set()
+        drop_prob = self._get_apf_drop_prob()
+        if drop_prob >= 1.0:
+            newly_retired_prompt_ids = set(retirement_candidate_prompt_ids)
+        elif drop_prob > 0.0:
+            for prompt_id in sorted(retirement_candidate_prompt_ids):
+                if self._apf_random.random() < drop_prob:
+                    newly_retired_prompt_ids.add(prompt_id)
+            self._store_apf_rng_state()
+
+        retired_prompt_ids = previous_retired_prompt_ids | newly_retired_prompt_ids
+        self._set_apf_retired_prompt_ids(retired_prompt_ids, state=state)
         total_prompt_count = len(self.dataset.origin_samples) if self.dataset is not None else 0
-        skipped_prompt_draw_count = float(state.get(APF_SKIP_DRAW_COUNT_KEY, 0))
-        kept_retired_prompt_draw_count = float(state.get(APF_KEEP_DRAW_COUNT_KEY, 0))
-        state[APF_SKIP_DRAW_COUNT_KEY] = 0
-        state[APF_KEEP_DRAW_COUNT_KEY] = 0
 
         return {
             "retired_prompt_frac": (len(retired_prompt_ids) / total_prompt_count) if total_prompt_count > 0 else 0.0,
-            "newly_retired_prompt_count": float(len(retired_prompt_ids - previous_retired)),
-            "skip_prompt_draw_count": skipped_prompt_draw_count,
-            "kept_retired_prompt_draw_count": kept_retired_prompt_draw_count,
+            "newly_retired_prompt_count": float(len(newly_retired_prompt_ids)),
+            "retirement_candidate_prompt_count": float(len(retirement_candidate_prompt_ids)),
+            "retirement_deferred_prompt_count": float(len(retirement_candidate_prompt_ids - newly_retired_prompt_ids)),
         }
 
     def _has_eligible_fresh_prompts(self) -> bool:
         if self.dataset is None or not self._adaptive_prompt_filter_enabled():
             return True
-        if any(not self.is_prompt_retired(get_scalerl_prompt_id(sample)) for sample in self.dataset.origin_samples):
-            return True
-        return len(self.dataset.origin_samples) > 0 and self._get_apf_drop_prob() < 1.0
+        return any(not self.is_prompt_retired(get_scalerl_prompt_id(sample)) for sample in self.dataset.origin_samples)
 
     def _should_skip_prompt_draw(self, prompt_id: int) -> bool:
-        if not self.is_prompt_retired(prompt_id):
-            return False
-
-        drop_prob = self._get_apf_drop_prob()
-        if drop_prob <= 0.0:
-            return False
-        if drop_prob >= 1.0:
-            return True
-
-        should_skip = self._apf_random.random() < drop_prob
-        self._store_apf_rng_state()
-        return should_skip
+        return self.is_prompt_retired(prompt_id)
 
     def _advance_dataset_cursor(self) -> Sample:
         assert self.dataset is not None
@@ -458,12 +476,7 @@ class ScaleRLRolloutDataSourceWithBuffer(RolloutDataSourceWithBuffer):
             prompt_sample = self._advance_dataset_cursor()
             prompt_id = get_scalerl_prompt_id(prompt_sample)
             if not self._should_skip_prompt_draw(prompt_id):
-                if self.is_prompt_retired(prompt_id):
-                    state = self._get_apf_state()
-                    state[APF_KEEP_DRAW_COUNT_KEY] = int(state.get(APF_KEEP_DRAW_COUNT_KEY, 0)) + 1
                 return prompt_sample
-            state = self._get_apf_state()
-            state[APF_SKIP_DRAW_COUNT_KEY] = int(state.get(APF_SKIP_DRAW_COUNT_KEY, 0)) + 1
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         samples = self._get_samples_from_buffer(num_samples)
