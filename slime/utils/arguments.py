@@ -354,6 +354,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--additional-sampling-step-size",
+                type=int,
+                default=None,
+                help=(
+                    "The sampling batch size for additional sampling steps beyond the initial rollout. "
+                    "This is used in the generate_rollout_async function after the first sampling. "
+                    "If this value is None, over_sampling_batch_size will be used as the default."
+                ),
+            )
+            parser.add_argument(
                 "--dynamic-sampling-filter-path",
                 type=str,
                 default=None,
@@ -1877,6 +1887,9 @@ def slime_validate_args(args):
         f"over_sampling_batch_size {args.over_sampling_batch_size} should be greater than or equal to "
         f"rollout_batch_size {args.rollout_batch_size}"
     )
+
+    if args.additional_sampling_step_size is None:
+        args.additional_sampling_step_size = args.over_sampling_batch_size
 
     if args.num_epoch is not None:
         if args.num_rollout is not None:

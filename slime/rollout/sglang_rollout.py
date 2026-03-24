@@ -384,15 +384,14 @@ async def generate_rollout_async(
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc="Rollout generation")
     samples_count = 0
     first_sampling = True
-    ADDITIONAL_SAMPLING_STEP_SIZE = 32
     while len(data) < target_data_size:
         # logger.info (f"state.remaining_batch_size - {state.remaining_batch_size}")
         while state.remaining_batch_size < target_data_size:
-            # get samples from the buffer and submit the generation requests. 
-            if first_sampling:           
+            # get samples from the buffer and submit the generation requests.
+            if first_sampling:
                 samples = data_source(args.over_sampling_batch_size)
             else:
-                samples = data_source(ADDITIONAL_SAMPLING_STEP_SIZE)
+                samples = data_source(args.additional_sampling_step_size)
             samples_count += len(samples)
             logger.info(f"Total samples submitted for rollout till now: {samples_count}, current samples: {len(samples)}")
             state.submit_generate_tasks(samples)

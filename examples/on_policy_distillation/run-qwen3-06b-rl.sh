@@ -97,6 +97,7 @@ ROLLOUT_ARGS=(
    --rollout-batch-size 32
    --num-steps-per-rollout 4
    --over-sampling-batch-size 48
+   --additional-sampling-step-size 32
    --n-samples-per-prompt 8
    --rollout-max-response-len $MAX_SEQ_LEN
    --adaptive-prompt-filter-threshold $APF_THRESHOLD
