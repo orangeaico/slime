@@ -5,8 +5,11 @@ import threading
 import time
 
 # Import core functions from sglang_rollout directly to avoid code duplication
-from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
+from slime.rollout.base_types import RolloutFnTrainOutput
+from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
+from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group, generate_rollout as sglang_generate_rollout
 from slime.utils.async_utils import run
+from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
 # Global worker manager
@@ -19,10 +22,15 @@ def get_global_worker(args, data_buffer):
     global _global_worker
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
+            _reset_generate_state()
             print("Creating new global async worker...")
             _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=args.sglang_server_concurrency)
             _global_worker.start()
         return _global_worker
+
+
+def _reset_generate_state():
+    GenerateState._instances.pop(GenerateState, None)
 
 
 def stop_global_worker():
@@ -32,6 +40,7 @@ def stop_global_worker():
         if _global_worker is not None:
             _global_worker.stop()
             _global_worker = None
+        _reset_generate_state()
 
 
 class AsyncRolloutWorker:
@@ -45,8 +54,12 @@ class AsyncRolloutWorker:
         self.data_buffer = data_buffer  # Directly save data_buffer reference
         self.concurrency = concurrency
         self.running = True
-        self.output_queue = queue.Queue(maxsize=1000)  # Continuous output queue
+        # Fully async mode intentionally allows the worker to run ahead.
+        # Keep the result queue unbounded so task callbacks never block the
+        # worker event loop while pushing completed groups.
+        self.output_queue = queue.Queue()
         self.worker_thread = None
+        self.data_buffer_lock = threading.Lock()
         self.state = GenerateState(args)
 
     async def continuous_worker_loop(self):
@@ -71,7 +84,8 @@ class AsyncRolloutWorker:
 
                 # If active task count hasn't reached limit, try to get new data and start tasks
                 while len(active_tasks) < max_concurrent_tasks and self.running:
-                    samples = self.data_buffer.get_samples(1)
+                    with self.data_buffer_lock:
+                        samples = self.data_buffer.get_samples(1)
 
                     for group in samples:
                         group_id = group_id_counter
@@ -90,8 +104,12 @@ class AsyncRolloutWorker:
                         # Add completion callback
                         def make_callback(gid):
                             def task_done_callback(done_task):
-                                result = done_task.result()
-                                self.output_queue.put((gid, result))
+                                try:
+                                    result = done_task.result()
+                                except Exception as e:
+                                    print(f"Task {gid} failed with exception: {e}", flush=True)
+                                    return
+                                self.output_queue.put_nowait((gid, result))
 
                             return task_done_callback
 
@@ -158,6 +176,14 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
     # Simplified: directly use rollout_batch_size as target
     target_data_size = args.rollout_batch_size
 
+    dynamic_filter = (
+        load_function(args.dynamic_sampling_filter_path)
+        if getattr(args, "dynamic_sampling_filter_path", None) is not None
+        else None
+    )
+    metric_gatherer = MetricGatherer()
+    all_data = []  # tracks all non-aborted groups including dynamically filtered ones
+
     data = []
     completed_groups = {}
     do_print = True
@@ -203,7 +229,8 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
             if any_aborted:
                 try:
                     # add back to buffer so it can be retried or handled by buffer policy
-                    data_buffer.add_samples([group])
+                    with worker.data_buffer_lock:
+                        data_buffer.add_samples([group])
                     print(f"Returned aborted group {group_id} to data buffer", flush=True)
                 except Exception as e:
                     print(f"Failed to return aborted group {group_id} to buffer: {e}", flush=True)
@@ -218,7 +245,13 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                 )
                 do_print = False
 
-            # Simplified: directly add samples, no filters used
+            all_data.append(group)
+            dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
+            if not dynamic_filter_output.keep:
+                metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
+                processed_any = True
+                continue
+
             data.append(group)
             processed_any = True
 
@@ -246,13 +279,30 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
             flush=True,
         )
 
+    if getattr(args, "rollout_sample_filter_path", None) is not None:
+        filter_func = load_function(args.rollout_sample_filter_path)
+        filter_func(args, data)
+
+    all_samples = sorted(all_data, key=lambda group: group[0].index)
+
+    if getattr(args, "rollout_all_samples_process_path", None) is not None:
+        process_func = load_function(args.rollout_all_samples_process_path)
+        # Pass data_buffer.get_samples (bound method) so _resolve_scalerl_data_source
+        # can extract the data source instance via __self__.
+        with worker.data_buffer_lock:
+            process_func(args, all_samples, data_buffer.get_samples)
+
     data = sorted(data, key=lambda group: group[0].index)
-    return data
+    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect())
 
 
 def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=False):
     if evaluation:
-        raise ValueError("Evaluation mode not supported in simple async rollout")
+        stop_global_worker()
+        try:
+            return sglang_generate_rollout(args, rollout_id, data_buffer, evaluation=True)
+        finally:
+            _reset_generate_state()
 
     completed_samples = run(generate_rollout_async(args, rollout_id, data_buffer))
     return completed_samples

@@ -190,3 +190,21 @@ def test_async_train_does_not_queue_extra_rollout_after_final_status(monkeypatch
     assert actor_model.save_calls == [(1, True)]
     assert rollout_manager.saved_rollouts == [1]
     assert rollout_manager.disposed is True
+
+
+def test_async_train_keeps_prefetched_rollout_when_updating_weights_every_step(monkeypatch):
+    rollout_manager = FakeRolloutManager(
+        {
+            0: {"should_stop_after_training_batch": False},
+            1: {"should_stop_after_training_batch": False},
+        }
+    )
+    actor_model = FakeTrainModel()
+    module = _load_training_script(monkeypatch, "train_async", rollout_manager, actor_model)
+
+    module.train(_make_args(num_rollout=2, update_weights_interval=1, save_interval=None))
+
+    assert rollout_manager.generated_rollouts == [0, 1]
+    assert actor_model.train_rollouts == [(0, "rollout-data-0"), (1, "rollout-data-1")]
+    assert actor_model.update_weights_calls == 3
+    assert rollout_manager.disposed is True

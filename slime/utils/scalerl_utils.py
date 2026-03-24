@@ -218,6 +218,29 @@ def get_group_relative_focal_weights(
     return [group_weights.get(group_index, 1.0) for group_index in group_indices]
 
 
+def get_group_relative_prompt_success_rates(
+    raw_rewards: Sequence[float],
+    group_indices: Sequence[int],
+    *,
+    active_mask: Sequence[bool] | None = None,
+) -> dict[int, float]:
+    resolved_active_mask = _resolve_active_mask(active_mask, length=len(raw_rewards))
+    correctness_mask = _get_binary_correctness_mask(raw_rewards, active_mask=resolved_active_mask)
+
+    group_totals: dict[int, int] = {}
+    group_successes: dict[int, int] = {}
+    for group_index, is_correct, is_active in zip(group_indices, correctness_mask, resolved_active_mask, strict=True):
+        if not is_active:
+            continue
+        group_totals[group_index] = group_totals.get(group_index, 0) + 1
+        group_successes[group_index] = group_successes.get(group_index, 0) + int(is_correct)
+
+    return {
+        group_index: group_successes.get(group_index, 0) / total
+        for group_index, total in group_totals.items()
+    }
+
+
 def apply_group_relative_focal_weights_to_rewards(
     normalized_rewards: Sequence[float],
     raw_rewards: Sequence[float],
@@ -243,6 +266,50 @@ def apply_group_relative_focal_weights_to_rewards(
         float(reward) * weight if is_active else 0.0
         for reward, weight, is_active in zip(normalized_rewards, focal_weights, resolved_active_mask, strict=True)
     ]
+
+
+def compute_group_relative_focal_logging_metrics(
+    raw_rewards: Sequence[float],
+    pre_focal_rewards: Sequence[float],
+    post_focal_rewards: Sequence[float],
+    group_indices: Sequence[int],
+    gamma: float | None,
+    *,
+    active_mask: Sequence[bool] | None = None,
+) -> dict[str, float]:
+    if gamma is None:
+        return {}
+
+    resolved_active_mask = _resolve_active_mask(active_mask, length=len(raw_rewards))
+    success_rates = get_group_relative_prompt_success_rates(
+        raw_rewards,
+        group_indices,
+        active_mask=resolved_active_mask,
+    )
+    if not success_rates:
+        return {
+            "prompt_success_rate_mean": 0.0,
+            "focal_weight_mean": 0.0,
+            "pre_focal_reward_abs_mean": 0.0,
+            "post_focal_reward_abs_mean": 0.0,
+        }
+
+    prompt_success_rate_mean = sum(success_rates.values()) / len(success_rates)
+    focal_weight_mean = sum((1.0 - rate) ** gamma for rate in success_rates.values()) / len(success_rates)
+
+    active_pre = [abs(float(reward)) for reward, is_active in zip(pre_focal_rewards, resolved_active_mask, strict=True) if is_active]
+    active_post = [
+        abs(float(reward))
+        for reward, is_active in zip(post_focal_rewards, resolved_active_mask, strict=True)
+        if is_active
+    ]
+
+    return {
+        "prompt_success_rate_mean": prompt_success_rate_mean,
+        "focal_weight_mean": focal_weight_mean,
+        "pre_focal_reward_abs_mean": (sum(active_pre) / len(active_pre)) if active_pre else 0.0,
+        "post_focal_reward_abs_mean": (sum(active_post) / len(active_post)) if active_post else 0.0,
+    }
 
 
 def normalize_rewards_for_training(

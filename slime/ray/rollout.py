@@ -25,6 +25,7 @@ from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, co
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.scalerl_utils import (
     apply_group_relative_focal_weights_to_rewards,
+    compute_group_relative_focal_logging_metrics,
     get_batch_normalized_prompt_rewards,
     get_prompt_group_indices,
     get_prompt_group_mean_centered_rewards,
@@ -351,6 +352,7 @@ class RolloutManager:
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
         self.rollout_id = -1
         self._last_generate_status = _default_early_stop_status()
+        self._last_focal_reward_metrics: dict[str, float] = {}
 
         self._health_monitors = []
         if not self.args.debug_train_only and self.args.use_fault_tolerance:
@@ -410,12 +412,17 @@ class RolloutManager:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
-        _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        rollout_time = time.time() - start_time
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
+            _log_rollout_data(rollout_id, self.args, data, metrics, rollout_time)
             return
-        data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data, self.train_parallel_config["dp_size"])
+
+        train_data = self._convert_samples_to_train_data(data)
+        if self._last_focal_reward_metrics:
+            metrics = {**(metrics or {}), **self._last_focal_reward_metrics}
+        _log_rollout_data(rollout_id, self.args, data, metrics, rollout_time)
+        return self._split_train_data_by_dp(train_data, self.train_parallel_config["dp_size"])
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -653,22 +660,32 @@ class RolloutManager:
                     active_mask=active_mask,
                 )
 
-        normalized_rewards = [
+        pre_focal_rewards = [
             reward if is_active else 0.0
             for reward, is_active in zip(normalized_rewards, active_mask, strict=True)
         ]
-        normalized_rewards = apply_group_relative_focal_weights_to_rewards(
-            normalized_rewards,
+        post_focal_rewards = apply_group_relative_focal_weights_to_rewards(
+            pre_focal_rewards,
             raw_rewards,
             group_indices,
             getattr(self.args, "group_relative_focal_gamma", None),
             active_mask=active_mask,
         )
-        logger.info(
-            f"[DEBUG] Sum of normalized rewards after focal scaling: {sum(normalized_rewards)}, "
-            f"Mean: {sum(normalized_rewards)/len(normalized_rewards)}"
+        focal_metrics = compute_group_relative_focal_logging_metrics(
+            raw_rewards=raw_rewards,
+            pre_focal_rewards=pre_focal_rewards,
+            post_focal_rewards=post_focal_rewards,
+            group_indices=group_indices,
+            gamma=getattr(self.args, "group_relative_focal_gamma", None),
+            active_mask=active_mask,
         )
-        return raw_rewards, normalized_rewards
+        self._last_focal_reward_metrics = {f"rollout/{key}": value for key, value in focal_metrics.items()}
+
+        logger.info(
+            f"[DEBUG] Sum of normalized rewards after focal scaling: {sum(post_focal_rewards)}, "
+            f"Mean: {sum(post_focal_rewards)/len(post_focal_rewards)}"
+        )
+        return raw_rewards, post_focal_rewards
 
     def _convert_samples_to_train_data(self, samples: list[Sample] | list[list[Sample]]):
         """

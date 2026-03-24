@@ -6,9 +6,11 @@ import torch
 from slime.utils.scalerl_utils import (
     apply_group_relative_focal_weights_to_rewards,
     apply_length_penalty,
+    compute_group_relative_focal_logging_metrics,
     compute_dapo_style_length_penalty,
     get_batch_normalized_prompt_rewards,
     get_group_relative_focal_weights,
+    get_group_relative_prompt_success_rates,
     get_prompt_group_mean_centered_rewards,
     get_prompt_loss_token_weights,
     get_required_prompt_group_multiple,
@@ -219,6 +221,42 @@ def test_group_relative_focal_weights_reject_non_binary_rewards():
             group_indices=[0, 0],
             gamma=1.0,
         )
+
+
+def test_group_relative_prompt_success_rates_tracks_prompt_level_success():
+    success_rates = get_group_relative_prompt_success_rates(
+        raw_rewards=[1.0, 0.0, 1.0, 1.0],
+        group_indices=[0, 0, 1, 1],
+    )
+
+    assert success_rates == pytest.approx({0: 0.5, 1: 1.0})
+
+
+def test_compute_group_relative_focal_logging_metrics_high_signal_values():
+    metrics = compute_group_relative_focal_logging_metrics(
+        raw_rewards=[1.0, 0.0, 1.0, 1.0],
+        pre_focal_rewards=[2.0, -2.0, 1.0, -1.0],
+        post_focal_rewards=[1.0, -1.0, 0.0, 0.0],
+        group_indices=[0, 0, 1, 1],
+        gamma=1.0,
+    )
+
+    assert metrics["prompt_success_rate_mean"] == pytest.approx(0.75)
+    assert metrics["focal_weight_mean"] == pytest.approx(0.25)
+    assert metrics["pre_focal_reward_abs_mean"] == pytest.approx(1.5)
+    assert metrics["post_focal_reward_abs_mean"] == pytest.approx(0.5)
+
+
+def test_compute_group_relative_focal_logging_metrics_disabled_when_gamma_none():
+    metrics = compute_group_relative_focal_logging_metrics(
+        raw_rewards=[1.0, 0.0],
+        pre_focal_rewards=[0.5, -0.5],
+        post_focal_rewards=[0.5, -0.5],
+        group_indices=[0, 0],
+        gamma=None,
+    )
+
+    assert metrics == {}
 
 
 def test_required_prompt_group_multiple_uses_lcm():
