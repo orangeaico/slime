@@ -430,6 +430,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--pipeline-rl-k",
+                type=int,
+                default=None,
+                help=(
+                    "Approximate PipelineRL-k backlog bound for the fully-async rollout worker. "
+                    "When set, the worker avoids keeping more than k rollout batches worth of completed "
+                    "or in-flight groups ahead of the trainer. This is currently consumed by "
+                    "examples/fully_async/fully_async_rollout.py."
+                ),
+            )
+            parser.add_argument(
                 "--custom-generate-function-path",
                 type=str,
                 default=None,
@@ -1744,6 +1755,9 @@ def slime_validate_args(args):
             raise ValueError("--max-fresh-prompt-passes must be greater than 0.")
         if not args.rollout_global_dataset:
             raise ValueError("--max-fresh-prompt-passes requires rollout_global_dataset to be enabled.")
+
+    if args.pipeline_rl_k is not None and args.pipeline_rl_k <= 0:
+        raise ValueError("--pipeline-rl-k must be greater than 0 when set.")
 
     assert not (args.kl_coef != 0 and args.kl_loss_coef != 0), "Only one of kl_coef and kl_loss_coef can be set"
 

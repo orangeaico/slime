@@ -13,6 +13,7 @@ from slime.utils import train_metric_utils
 from slime.utils.data import get_minimum_num_micro_batch_size
 from slime.utils.flops_utils import calculate_fwd_flops
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step
+from slime.utils.policy_version_utils import compute_policy_lag_metrics_from_rollout_data
 from slime.utils.scalerl_utils import get_active_sample_mask_from_loss_masks
 from slime.utils.seqlen_balancing import get_seqlen_balanced_partitions
 from slime.utils.types import RolloutBatch
@@ -427,6 +428,7 @@ def log_rollout_data(
     rollout_id: int,
     args: Namespace,
     rollout_data: RolloutBatch,
+    current_policy_version: int | None = None,
 ) -> None:
     """
     Summarize rollout fields and log reduced metrics on PP last stage, TP rank 0.
@@ -447,6 +449,7 @@ def log_rollout_data(
         max_seq_lens = rollout_data.get("max_seq_lens", None)
         active_sample_mask = _get_active_sample_mask(rollout_data)
         num_active_samples = max(sum(active_sample_mask), 1)
+        log_dict |= compute_policy_lag_metrics_from_rollout_data(rollout_data, current_policy_version)
 
         for key, val in rollout_data.items():
             if key in [
@@ -462,6 +465,12 @@ def log_rollout_data(
                 "max_seq_lens",
                 "dynamic_global_batch_size",
                 "active_sample_mask",
+                "policy_version_min",
+                "policy_version_max",
+                "policy_version_last",
+                "policy_version_span",
+                "policy_version_count",
+                "policy_version_mixed",
             ]:
                 continue
             # Upload per sample mean for each rollout value

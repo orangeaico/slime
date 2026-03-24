@@ -361,7 +361,12 @@ class MegatronTrainRayActor(TrainRayActor):
 
         with timer("data_preprocess"):
             rollout_data = self._get_rollout_data(rollout_data_ref)
-            log_rollout_data(rollout_id, self.args, rollout_data)
+            log_rollout_data(
+                rollout_id,
+                self.args,
+                rollout_data,
+                current_policy_version=getattr(getattr(self, "weight_updater", None), "weight_version", None),
+            )
 
         if self.role == "critic":
             return self.train_critic(rollout_id, rollout_data)
@@ -467,6 +472,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_id,
                 self.args,
                 rollout_data,
+                current_policy_version=self.weight_updater.weight_version,
             )
 
             # Train

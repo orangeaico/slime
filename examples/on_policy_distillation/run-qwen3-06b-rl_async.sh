@@ -93,7 +93,7 @@ ROLLOUT_ARGS=(
    --reward-key score
 
    --num-rollout 702
-   --max-fresh-prompt-passes 4
+   # --max-fresh-prompt-passes 4
    --rollout-batch-size 32
    --num-steps-per-rollout 4
    --over-sampling-batch-size 48
@@ -110,6 +110,7 @@ ROLLOUT_ARGS=(
    --rollout-top-p 0.8
    --rollout-top-k 20
    --use-rollout-logprobs
+   --pipeline-rl-k 2
    --rollout-sample-filter-path slime.rollout.filter_hub.sample_filters.mark_truncated_samples_inactive
    --rollout-function-path examples.fully_async.fully_async_rollout.generate_rollout_fully_async
 
@@ -157,7 +158,7 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    ${LOSS_ARGS[@]}
-   --group-relative-focal-gamma 0.5
+   # --group-relative-focal-gamma 0.5
    --batch-level-normalization
    --prompt-level-loss-aggregation
    --kl-loss-coef 0.00

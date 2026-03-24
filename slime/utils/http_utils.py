@@ -6,6 +6,8 @@ import multiprocessing
 import os
 import random
 import socket
+import threading
+import weakref
 
 import httpx
 
@@ -144,7 +146,8 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
         process.join()
 
 
-_http_client: httpx.AsyncClient | None = None
+_http_clients_by_loop: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = weakref.WeakKeyDictionary()
+_http_client_lock = threading.Lock()
 _client_concurrency: int = 0
 
 # Optional Ray-based distributed POST dispatch
@@ -213,18 +216,34 @@ async def _post(client, url, payload, max_retries=60, headers=None):
     return output
 
 
+def _create_http_client(concurrency: int) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=max(1, concurrency)),
+        timeout=httpx.Timeout(None),
+    )
+
+
+def _get_http_client() -> httpx.AsyncClient:
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError as exc:
+        raise RuntimeError("HTTP client access requires a running event loop.") from exc
+
+    with _http_client_lock:
+        client = _http_clients_by_loop.get(loop)
+        if client is None:
+            client = _create_http_client(_client_concurrency)
+            _http_clients_by_loop[loop] = client
+    return client
+
+
 def init_http_client(args):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
-    global _http_client, _client_concurrency, _distributed_post_enabled
+    global _client_concurrency, _distributed_post_enabled
     if not args.rollout_num_gpus:
         return
 
     _client_concurrency = args.sglang_server_concurrency * args.rollout_num_gpus // args.rollout_num_gpus_per_engine
-    if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
-            timeout=httpx.Timeout(None),
-        )
 
     # Optionally initialize distributed POST via Ray without changing interfaces
     if args.use_distributed_post:
@@ -254,13 +273,13 @@ def _init_ray_distributed_post(args):
     @ray.remote
     class _HttpPosterActor:
         def __init__(self, concurrency: int):
-            # Lazy creation to this actor's event loop
-            self._client = httpx.AsyncClient(
-                limits=httpx.Limits(max_connections=max(1, concurrency)),
-                timeout=httpx.Timeout(None),
-            )
+            # Delay client creation until the async actor loop uses it.
+            self._client = None
+            self._concurrency = concurrency
 
         async def do_post(self, url, payload, max_retries=60, headers=None):
+            if self._client is None:
+                self._client = _create_http_client(self._concurrency)
             return await _post(self._client, url, payload, max_retries, headers=headers)
 
     # Create actors per node
@@ -300,15 +319,16 @@ async def post(url, payload, max_retries=60, headers=None):
             logger.info(f"[http_utils] Distributed POST failed, falling back to local: {e} (url={url})")
             # fall through to local
 
-    return await _post(_http_client, url, payload, max_retries, headers=headers)
+    return await _post(_get_http_client(), url, payload, max_retries, headers=headers)
 
 
 async def get(url, max_retries=60):
+    client = _get_http_client()
     retry_count = 0
     while retry_count < max_retries:
         response = None
         try:
-            response = await _http_client.get(url)
+            response = await client.get(url)
             response.raise_for_status()
             content = await response.aread()
             output = json.loads(content)

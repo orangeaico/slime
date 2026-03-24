@@ -23,6 +23,10 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.policy_version_utils import (
+    build_policy_version_train_data,
+    compute_policy_version_metrics_from_samples,
+)
 from slime.utils.scalerl_utils import (
     apply_group_relative_focal_weights_to_rewards,
     compute_group_relative_focal_logging_metrics,
@@ -757,6 +761,8 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        train_data |= build_policy_version_train_data(samples)
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -803,6 +809,12 @@ class RolloutManager:
                 "rollout_routed_experts",
                 "prompt",
                 "teacher_log_probs",
+                "policy_version_min",
+                "policy_version_max",
+                "policy_version_last",
+                "policy_version_span",
+                "policy_version_count",
+                "policy_version_mixed",
             ]:
                 if key not in data:
                     continue
@@ -1113,6 +1125,7 @@ def compute_metrics_from_samples(args, samples):
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
     log_dict |= compute_scalerl_metrics_from_samples(args, active_samples)
+    log_dict |= compute_policy_version_metrics_from_samples(active_samples)
     log_dict |= _compute_zero_std_metrics(args, active_samples)
     log_dict |= _compute_reward_cat_metrics(args, active_samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in active_samples]).item()
