@@ -1,9 +1,11 @@
 import asyncio
 import atexit
 from collections import Counter
+import logging
 import queue
 import threading
 import time
+import logging
 
 import ray
 
@@ -16,9 +18,13 @@ from slime.utils.async_utils import run
 from slime.utils.misc import load_function
 from slime.utils.types import Sample
 
+logger = logging.getLogger(__name__)
+
 # Global worker manager
 _global_worker = None
 _worker_lock = threading.Lock()
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_pipeline_rl_outstanding_group_limit(args) -> int | None:
@@ -33,6 +39,7 @@ def _compute_pipeline_rl_metrics(
     trainer_step: int,
     generation_step: int | None,
     oldest_outstanding_generation_step: int | None,
+    waiting_groups: int,
 ) -> dict[str, float]:
     step_lead = get_pipeline_rl_step_lead(
         trainer_step=trainer_step,
@@ -45,6 +52,7 @@ def _compute_pipeline_rl_metrics(
     return {
         "pipeline_rl/oldest_step_gap": oldest_step_gap,
         "pipeline_rl/step_lead": step_lead,
+        "pipeline_rl/waiting_groups": waiting_groups,
     }
 
 
@@ -54,7 +62,7 @@ def get_global_worker(args, data_buffer):
     with _worker_lock:
         if _global_worker is None or not _global_worker.worker_thread.is_alive():
             _reset_generate_state()
-            print("Creating new global async worker...")
+            logger.info("Creating new global async worker...")
             _global_worker = AsyncRolloutWorker(args, data_buffer, concurrency=args.sglang_server_concurrency)
             _global_worker.start()
         return _global_worker
@@ -111,7 +119,7 @@ class AsyncRolloutWorker:
         try:
             self.latest_known_trainer_step = int(ray.get(self.pipeline_rl_controller.get_trainer_step.remote()))
         except Exception as e:
-            print(f"Failed to refresh PipelineRL trainer step: {e}", flush=True)
+            logger.warning(f"Failed to refresh PipelineRL trainer step: {e}")
 
     def _recompute_pipeline_snapshot_locked(self) -> tuple[int | None, int | None]:
         outstanding_steps = set(self._active_step_counts) | set(self._queued_step_counts)
@@ -124,6 +132,9 @@ class AsyncRolloutWorker:
 
     def _get_outstanding_group_count_locked(self) -> int:
         return sum(self._active_step_counts.values()) + sum(self._queued_step_counts.values())
+
+    def _get_waiting_group_count_locked(self) -> int:
+        return sum(self._queued_step_counts.values())
 
     def _can_schedule_more_groups(self) -> bool:
         if self.outstanding_group_limit is None:
@@ -151,13 +162,12 @@ class AsyncRolloutWorker:
 
         self._generator_throttle_active = True
         self._last_generator_throttle_log_time = now
-        print(
+        logger.info(
             "PipelineRL-k generator throttle active: "
             f"outstanding_groups={outstanding_groups}/{self.outstanding_group_limit}, "
             f"trainer_step={self.latest_known_trainer_step}, "
             f"oldest_outstanding_generation_step={oldest_outstanding_generation_step}, "
             f"newest_outstanding_generation_step={newest_outstanding_generation_step}",
-            flush=True,
         )
 
     def _maybe_report_pipeline_snapshot(self) -> None:
@@ -171,7 +181,7 @@ class AsyncRolloutWorker:
         try:
             self.pipeline_rl_controller.report_outstanding.remote(*snapshot)
         except Exception as e:
-            print(f"Failed to report PipelineRL snapshot: {e}", flush=True)
+            logger.warning(f"Failed to report PipelineRL snapshot: {e}")
 
     def _record_task_started(self, generation_step: int) -> None:
         with self.pipeline_state_lock:
@@ -207,15 +217,17 @@ class AsyncRolloutWorker:
         with self.pipeline_state_lock:
             generation_step = self.latest_newest_outstanding_step
             oldest_outstanding_generation_step = self.latest_oldest_outstanding_step
+            waiting_groups = self._get_waiting_group_count_locked()
         return _compute_pipeline_rl_metrics(
             trainer_step=self.latest_known_trainer_step,
             generation_step=generation_step,
             oldest_outstanding_generation_step=oldest_outstanding_generation_step,
+            waiting_groups=waiting_groups,
         )
 
     async def continuous_worker_loop(self):
         """Continuous work loop - constantly get data from data_buffer and process"""
-        print("Continuous async rollout worker started")
+        logger.info("Continuous async rollout worker started")
 
         active_tasks = set()
         max_concurrent_tasks = self.args.rollout_batch_size
@@ -230,7 +242,7 @@ class AsyncRolloutWorker:
                         try:
                             task.result()  # Results are already handled in callbacks
                         except Exception as e:
-                            print(f"Task failed with exception: {e}")
+                            logger.warning(f"Task failed with exception: {e}")
                     active_tasks -= done_tasks
 
                 # If active task count hasn't reached limit, try to get new data and start tasks
@@ -262,7 +274,7 @@ class AsyncRolloutWorker:
                                 try:
                                     result = done_task.result()
                                 except Exception as e:
-                                    print(f"Task {gid} failed with exception: {e}", flush=True)
+                                    logger.warning(f"Task {gid} failed with exception: {e}")
                                     self._record_task_finished(generation_step, queued_for_training=False)
                                     return
                                 self._record_task_finished(generation_step, queued_for_training=True)
@@ -285,11 +297,11 @@ class AsyncRolloutWorker:
                 await asyncio.sleep(1)
 
             except Exception as e:
-                print(f"Error in continuous worker loop: {e}")
+                logger.exception(f"Error in continuous worker loop: {e}")
                 await asyncio.sleep(1)
 
         if active_tasks:
-            print(f"Waiting for {len(active_tasks)} continuous tasks to complete...")
+            logger.info(f"Waiting for {len(active_tasks)} continuous tasks to complete...")
             await asyncio.wait(active_tasks)
 
         self._record_groups_drained(
@@ -299,9 +311,9 @@ class AsyncRolloutWorker:
             try:
                 ray.get(self.pipeline_rl_controller.clear_outstanding.remote())
             except Exception as e:
-                print(f"Failed to clear PipelineRL coordinator state: {e}", flush=True)
+                logger.warning(f"Failed to clear PipelineRL coordinator state: {e}")
 
-        print("Continuous async rollout worker stopped")
+        logger.info("Continuous async rollout worker stopped")
 
     def worker_thread_func(self):
         """Worker function running in independent thread"""
@@ -312,20 +324,22 @@ class AsyncRolloutWorker:
         if self.worker_thread is None or not self.worker_thread.is_alive():
             self.worker_thread = threading.Thread(target=self.worker_thread_func, daemon=True)
             self.worker_thread.start()
-            print("Started continuous async worker thread")
+            logger.info("Started continuous async worker thread")
 
     def stop(self):
         """Stop worker thread"""
         self.running = False
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=5)
-        print("Stopped async worker thread")
+        logger.info("Stopped async worker thread")
 
-    def get_completed_groups(self) -> list[tuple]:
+    def get_completed_groups(self, max_groups: int | None = None) -> list[tuple]:
         """Get completed sample groups"""
         completed = []
         drained_steps = []
         while True:
+            if max_groups is not None and len(completed) >= max_groups:
+                break
             try:
                 result = self.output_queue.get_nowait()
                 completed.append(result)
@@ -364,8 +378,8 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
     completed_groups = {}
     do_print = True
 
-    print(f"Starting async rollout generation for {target_data_size} groups")
-    print(f"Global worker queue size: {worker.get_queue_size()}")
+    logger.info(f"Starting async rollout collection for {target_data_size} groups")
+    logger.info(f"Global worker queue size: {worker.get_queue_size()}")
 
     # Main loop: collect results from global worker's output queue
     start_time = time.time()
@@ -374,7 +388,8 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
 
     while len(data) < target_data_size:
         # Collect completed results
-        completed = worker.get_completed_groups()
+        remaining_groups_needed = max(target_data_size - len(data), 1)
+        completed = worker.get_completed_groups(max_groups=remaining_groups_needed)
 
         made_progress = False
         for completed_group in completed:
@@ -411,23 +426,23 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                     # add back to buffer so it can be retried or handled by buffer policy
                     with worker.data_buffer_lock:
                         data_buffer.add_samples([group])
-                    print(f"Returned aborted group {group_id} to data buffer", flush=True)
+                    logger.info(f"Returned aborted group {group_id} to data buffer")
                 except Exception as e:
-                    print(f"Failed to return aborted group {group_id} to buffer: {e}", flush=True)
+                    logger.warning(f"Failed to return aborted group {group_id} to buffer: {e}")
                 # don't count as processed for training
                 continue
 
             if do_print:
-                print(
+                logger.info(
                     f"First rollout sample: {[group[0].prompt + group[0].response]}, "
                     f"label: {group[0].label}, reward: {group[0].reward}",
-                    flush=True,
                 )
                 do_print = False
 
             all_data.append(group)
             dynamic_filter_output = call_dynamic_filter(dynamic_filter, args, group)
             if not dynamic_filter_output.keep:
+                logger.info(f"Dropping group {group[0][0].index if isinstance(group[0], list) else group[0].index} due to {dynamic_filter_output.reason}")
                 metric_gatherer.on_dynamic_filter_drop(reason=dynamic_filter_output.reason)
                 processed_any = True
                 continue
@@ -438,7 +453,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
         # Check progress
         current_time = time.time()
         if current_time - last_progress_time > no_progress_timeout:
-            print(
+            logger.warning(
                 f"Warning: No progress for {no_progress_timeout}s. "
                 f"Queue size: {worker.get_queue_size()}, "
                 f"Collected: {len(data)}/{target_data_size}"
@@ -450,13 +465,12 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
             await asyncio.sleep(0.01)
 
     duration = time.time() - start_time
-    print(f"Rollout completed in {duration:.2f}s! Global worker queue size: {worker.get_queue_size()}")
+    logger.info(f"Rollout completed in {duration:.2f}s! Global worker queue size: {worker.get_queue_size()}")
 
     if data:
-        print(
+        logger.info(
             f"Finish rollout: {[data[-1][0].prompt + data[-1][0].response]}, "
             f"label: {data[-1][0].label}, reward: {data[-1][0].reward}",
-            flush=True,
         )
 
     if getattr(args, "rollout_sample_filter_path", None) is not None:

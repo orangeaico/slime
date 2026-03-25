@@ -66,11 +66,17 @@ def train(args):
     init_tracking(args)
     pipeline_rl_controller = _maybe_create_pipeline_rl_controller(args)
     if pipeline_rl_controller is not None:
+        # Rollout workers need this handle, but training checkpoints persist args.
+        # Remove it after rollout manager creation to avoid serializing Ray actor handles.
         args.pipeline_rl_controller = pipeline_rl_controller
 
     # create the rollout manager, with sglang engines inside.
     # need to initialize rollout manager first to calculate num_rollout
-    rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    try:
+        rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    finally:
+        if pipeline_rl_controller is not None and hasattr(args, "pipeline_rl_controller"):
+            delattr(args, "pipeline_rl_controller")
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)

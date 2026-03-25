@@ -60,9 +60,11 @@ class FakeWorker:
         for gid, g in enumerate(groups_to_return):
             self._q.put((gid, g))
 
-    def get_completed_groups(self):
+    def get_completed_groups(self, max_groups=None):
         items = []
         while True:
+            if max_groups is not None and len(items) >= max_groups:
+                break
             try:
                 items.append(self._q.get_nowait())
             except queue.Empty:
@@ -268,11 +270,13 @@ def test_pipeline_rl_metrics_track_step_lead_instead_of_queue_depth():
         trainer_step=5,
         generation_step=3,
         oldest_outstanding_generation_step=2,
+        waiting_groups=4,
     )
 
     assert metrics == {
         "pipeline_rl/oldest_step_gap": 3,
         "pipeline_rl/step_lead": 2,
+        "pipeline_rl/waiting_groups": 4,
     }
 
 
@@ -283,11 +287,13 @@ def test_pipeline_rl_metrics_are_zero_without_outstanding_generation():
         trainer_step=5,
         generation_step=None,
         oldest_outstanding_generation_step=None,
+        waiting_groups=0,
     )
 
     assert metrics == {
         "pipeline_rl/oldest_step_gap": 0,
         "pipeline_rl/step_lead": 0,
+        "pipeline_rl/waiting_groups": 0,
     }
 
 
@@ -313,3 +319,18 @@ def test_generate_rollout_async_accepts_completed_groups_with_generation_step_me
 
     assert len(result.samples) == 1
     assert result.samples[0][0].index == 1
+
+
+def test_generate_rollout_async_does_not_overdrain_completed_queue():
+    args = _make_args(rollout_batch_size=1)
+    groups = [_make_group(0), _make_group(1)]
+    data_buffer = MagicMock()
+    fake_worker = FakeWorker(groups)
+
+    with patch("examples.fully_async.fully_async_rollout.get_global_worker", return_value=fake_worker):
+        from examples.fully_async.fully_async_rollout import generate_rollout_async
+
+        result = _run(generate_rollout_async(args, rollout_id=0, data_buffer=data_buffer))
+
+    assert len(result.samples) == 1
+    assert fake_worker.get_queue_size() == 1
