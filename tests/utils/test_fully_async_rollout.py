@@ -25,6 +25,7 @@ def _make_args(**overrides):
     base = dict(
         rollout_global_dataset=True,
         rollout_batch_size=2,
+        pipeline_rl_k=None,
         dynamic_sampling_filter_path=None,
         rollout_sample_filter_path=None,
         rollout_all_samples_process_path=None,
@@ -54,9 +55,10 @@ def _run(coro):
 class FakeWorker:
     """A minimal fake that feeds groups from a pre-loaded list."""
 
-    def __init__(self, groups_to_return):
+    def __init__(self, groups_to_return, *, trainer_step=0):
         self._q = queue.Queue()
         self.data_buffer_lock = threading.Lock()
+        self._trainer_step = trainer_step
         for gid, g in enumerate(groups_to_return):
             self._q.put((gid, g))
 
@@ -76,6 +78,9 @@ class FakeWorker:
 
     def get_pipeline_rl_metrics(self):
         return {}
+
+    def get_latest_trainer_step(self):
+        return self._trainer_step
 
 
 # ---------------------------------------------------------------------------
@@ -268,14 +273,12 @@ def test_pipeline_rl_metrics_track_step_lead_instead_of_queue_depth():
 
     metrics = _compute_pipeline_rl_metrics(
         trainer_step=5,
-        generation_step=3,
         oldest_outstanding_generation_step=2,
         waiting_groups=4,
     )
 
     assert metrics == {
-        "pipeline_rl/oldest_step_gap": 3,
-        "pipeline_rl/step_lead": 2,
+        "pipeline_rl/oldest_group_lag": 3,
         "pipeline_rl/waiting_groups": 4,
     }
 
@@ -285,24 +288,61 @@ def test_pipeline_rl_metrics_are_zero_without_outstanding_generation():
 
     metrics = _compute_pipeline_rl_metrics(
         trainer_step=5,
-        generation_step=None,
         oldest_outstanding_generation_step=None,
         waiting_groups=0,
     )
 
     assert metrics == {
-        "pipeline_rl/oldest_step_gap": 0,
-        "pipeline_rl/step_lead": 0,
+        "pipeline_rl/oldest_group_lag": 0,
         "pipeline_rl/waiting_groups": 0,
     }
 
 
-def test_pipeline_rl_outstanding_group_limit_scales_with_rollout_batch_size():
-    from examples.fully_async.fully_async_rollout import _resolve_pipeline_rl_outstanding_group_limit
+def test_stale_group_is_dropped_requeued_with_reset_and_metrics_updated():
+    stale_group = _make_group(0)
+    stale_group[0].status = Sample.Status.COMPLETED
+    stale_group[0].tokens = [1, 2, 3]
+    stale_group[0].response = "stale"
+    stale_group[0].response_length = 5
+    stale_group[0].reward = 1.0
+    stale_group[0].weight_versions = ["2"]
 
-    args = _make_args(rollout_batch_size=4, pipeline_rl_k=2)
+    accepted_group = _make_group(1)
+    accepted_group[0].status = Sample.Status.COMPLETED
 
-    assert _resolve_pipeline_rl_outstanding_group_limit(args) == 8
+    data_buffer = MagicMock()
+    fake_worker = FakeWorker([], trainer_step=5)
+    fake_worker.get_completed_groups = MagicMock(
+        side_effect=[
+            [(0, 1, stale_group)],
+            [(1, 4, accepted_group)],
+        ]
+    )
+
+    with patch("examples.fully_async.fully_async_rollout.get_global_worker", return_value=fake_worker):
+        from examples.fully_async.fully_async_rollout import generate_rollout_async
+
+        result = _run(
+            generate_rollout_async(
+                _make_args(rollout_batch_size=1, pipeline_rl_k=2),
+                rollout_id=0,
+                data_buffer=data_buffer,
+            )
+        )
+
+    assert len(result.samples) == 1
+    assert result.samples[0][0].index == 1
+    data_buffer.add_samples.assert_called_once()
+    requeued_group = data_buffer.add_samples.call_args.args[0][0]
+    requeued_sample = requeued_group[0]
+    assert requeued_sample.status == Sample.Status.PENDING
+    assert requeued_sample.tokens == []
+    assert requeued_sample.response == ""
+    assert requeued_sample.response_length == 0
+    assert requeued_sample.reward is None
+    assert requeued_sample.weight_versions == []
+
+    assert result.metrics["pipeline_rl/stale_drop_groups"] == 1
 
 
 def test_generate_rollout_async_accepts_completed_groups_with_generation_step_metadata():

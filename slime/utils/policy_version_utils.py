@@ -94,13 +94,6 @@ def compute_policy_lag_metrics_from_rollout_data(
 
     metrics: dict[str, float] = {}
 
-    last_versions = rollout_data.get("policy_version_last")
-    if last_versions:
-        parsed_last_versions = [version for version in (parse_policy_version(item) for item in last_versions) if version is not None]
-        if parsed_last_versions:
-            last_lags = [max(current_policy_version - version, 0) for version in parsed_last_versions]
-            metrics["policy_lag/mean"] = sum(last_lags) / len(last_lags)
-
     oldest_versions = rollout_data.get("policy_version_min")
     if oldest_versions:
         parsed_oldest_versions = [

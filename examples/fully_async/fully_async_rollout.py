@@ -5,12 +5,11 @@ import logging
 import queue
 import threading
 import time
-import logging
 
 import ray
 
 # Import core functions from sglang_rollout directly to avoid code duplication
-from slime.ray.pipeline_rl_controller import get_pipeline_rl_oldest_step_gap, get_pipeline_rl_step_lead
+from slime.ray.pipeline_rl_controller import get_pipeline_rl_oldest_step_gap
 from slime.rollout.base_types import RolloutFnTrainOutput
 from slime.rollout.filter_hub.base_types import MetricGatherer, call_dynamic_filter
 from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group, generate_rollout as sglang_generate_rollout
@@ -24,35 +23,54 @@ logger = logging.getLogger(__name__)
 _global_worker = None
 _worker_lock = threading.Lock()
 
-logger = logging.getLogger(__name__)
-
-
-def _resolve_pipeline_rl_outstanding_group_limit(args) -> int | None:
-    pipeline_rl_k = getattr(args, "pipeline_rl_k", None)
-    if pipeline_rl_k is None:
-        return None
-    return max(1, int(pipeline_rl_k) * int(args.rollout_batch_size))
-
 
 def _compute_pipeline_rl_metrics(
     *,
     trainer_step: int,
-    generation_step: int | None,
     oldest_outstanding_generation_step: int | None,
     waiting_groups: int,
 ) -> dict[str, float]:
-    step_lead = get_pipeline_rl_step_lead(
-        trainer_step=trainer_step,
-        generation_step=generation_step,
-    )
     oldest_step_gap = get_pipeline_rl_oldest_step_gap(
         trainer_step=trainer_step,
         oldest_outstanding_generation_step=oldest_outstanding_generation_step,
     )
     return {
-        "pipeline_rl/oldest_step_gap": oldest_step_gap,
-        "pipeline_rl/step_lead": step_lead,
+        "pipeline_rl/oldest_group_lag": oldest_step_gap,
         "pipeline_rl/waiting_groups": waiting_groups,
+    }
+
+
+def _reset_sample_for_regeneration(sample: Sample) -> Sample:
+    sample.tokens = []
+    sample.response = ""
+    sample.response_length = 0
+    sample.reward = None
+    sample.loss_mask = None
+    sample.weight_versions = []
+    sample.rollout_log_probs = None
+    sample.rollout_routed_experts = None
+    sample.teacher_log_probs = None
+    sample.remove_sample = False
+    sample.status = Sample.Status.PENDING
+    sample.train_metadata = None
+    sample.session_id = None
+    sample.non_generation_time = 0.0
+    sample.multimodal_train_inputs = None
+    sample.spec_info = Sample.SpecInfo()
+    sample.prefix_cache_info = Sample.PrefixCacheInfo()
+    return sample
+
+
+def _reset_group_for_regeneration(group: list[Sample]) -> list[Sample]:
+    return [_reset_sample_for_regeneration(sample) for sample in group]
+
+
+def _collect_stale_metrics(
+    *,
+    stale_drop_groups: int,
+) -> dict[str, float]:
+    return {
+        "pipeline_rl/stale_drop_groups": stale_drop_groups,
     }
 
 
@@ -103,15 +121,12 @@ class AsyncRolloutWorker:
         self.state = GenerateState(args)
         self.pipeline_rl_k = getattr(args, "pipeline_rl_k", None)
         self.pipeline_rl_controller = getattr(args, "pipeline_rl_controller", None)
-        self.outstanding_group_limit = _resolve_pipeline_rl_outstanding_group_limit(args)
         self.latest_known_trainer_step = 0
         self.latest_oldest_outstanding_step: int | None = None
         self.latest_newest_outstanding_step: int | None = None
         self._active_step_counts: Counter[int] = Counter()
         self._queued_step_counts: Counter[int] = Counter()
         self._last_reported_pipeline_snapshot: tuple[int | None, int | None] | None = None
-        self._generator_throttle_active = False
-        self._last_generator_throttle_log_time = 0.0
 
     def _sync_trainer_step(self) -> None:
         if self.pipeline_rl_controller is None:
@@ -130,45 +145,8 @@ class AsyncRolloutWorker:
             self.latest_newest_outstanding_step,
         )
 
-    def _get_outstanding_group_count_locked(self) -> int:
-        return sum(self._active_step_counts.values()) + sum(self._queued_step_counts.values())
-
     def _get_waiting_group_count_locked(self) -> int:
         return sum(self._queued_step_counts.values())
-
-    def _can_schedule_more_groups(self) -> bool:
-        if self.outstanding_group_limit is None:
-            return True
-        with self.pipeline_state_lock:
-            return self._get_outstanding_group_count_locked() < self.outstanding_group_limit
-
-    def _maybe_log_generator_throttle(self, *, active_tasks: int, max_concurrent_tasks: int) -> None:
-        if self.outstanding_group_limit is None or active_tasks >= max_concurrent_tasks:
-            self._generator_throttle_active = False
-            return
-
-        with self.pipeline_state_lock:
-            outstanding_groups = self._get_outstanding_group_count_locked()
-            oldest_outstanding_generation_step = self.latest_oldest_outstanding_step
-            newest_outstanding_generation_step = self.latest_newest_outstanding_step
-
-        if outstanding_groups < self.outstanding_group_limit:
-            self._generator_throttle_active = False
-            return
-
-        now = time.time()
-        if self._generator_throttle_active and now - self._last_generator_throttle_log_time < 5.0:
-            return
-
-        self._generator_throttle_active = True
-        self._last_generator_throttle_log_time = now
-        logger.info(
-            "PipelineRL-k generator throttle active: "
-            f"outstanding_groups={outstanding_groups}/{self.outstanding_group_limit}, "
-            f"trainer_step={self.latest_known_trainer_step}, "
-            f"oldest_outstanding_generation_step={oldest_outstanding_generation_step}, "
-            f"newest_outstanding_generation_step={newest_outstanding_generation_step}",
-        )
 
     def _maybe_report_pipeline_snapshot(self) -> None:
         if self.pipeline_rl_controller is None:
@@ -215,15 +193,17 @@ class AsyncRolloutWorker:
             return {}
         self._sync_trainer_step()
         with self.pipeline_state_lock:
-            generation_step = self.latest_newest_outstanding_step
             oldest_outstanding_generation_step = self.latest_oldest_outstanding_step
             waiting_groups = self._get_waiting_group_count_locked()
         return _compute_pipeline_rl_metrics(
             trainer_step=self.latest_known_trainer_step,
-            generation_step=generation_step,
             oldest_outstanding_generation_step=oldest_outstanding_generation_step,
             waiting_groups=waiting_groups,
         )
+
+    def get_latest_trainer_step(self) -> int:
+        self._sync_trainer_step()
+        return int(self.latest_known_trainer_step)
 
     async def continuous_worker_loop(self):
         """Continuous work loop - constantly get data from data_buffer and process"""
@@ -248,8 +228,7 @@ class AsyncRolloutWorker:
                 # If active task count hasn't reached limit, try to get new data and start tasks
                 self._sync_trainer_step()
 
-                # Keep the generator from running more than k rollout batches ahead.
-                while len(active_tasks) < max_concurrent_tasks and self.running and self._can_schedule_more_groups():
+                while len(active_tasks) < max_concurrent_tasks and self.running:
                     with self.data_buffer_lock:
                         samples = self.data_buffer.get_samples(1)
 
@@ -287,10 +266,6 @@ class AsyncRolloutWorker:
                         self._record_task_started(generation_step)
                         break
 
-                self._maybe_log_generator_throttle(
-                    active_tasks=len(active_tasks),
-                    max_concurrent_tasks=max_concurrent_tasks,
-                )
                 self._maybe_report_pipeline_snapshot()
 
                 # Brief sleep to avoid busy waiting
@@ -377,6 +352,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
     data = []
     completed_groups = {}
     do_print = True
+    stale_drop_groups = 0
 
     logger.info(f"Starting async rollout collection for {target_data_size} groups")
     logger.info(f"Global worker queue size: {worker.get_queue_size()}")
@@ -394,10 +370,11 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
         made_progress = False
         for completed_group in completed:
             if len(completed_group) == 3:
-                group_id, _generation_step, group = completed_group
+                group_id, generation_step, group = completed_group
             else:
+                generation_step = None
                 group_id, group = completed_group
-            completed_groups[group_id] = group
+            completed_groups[group_id] = (generation_step, group)
             made_progress = True
 
         if made_progress:
@@ -412,7 +389,26 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
             if len(data) >= target_data_size:
                 break
 
-            group = completed_groups.pop(group_id)
+            generation_step, group = completed_groups.pop(group_id)
+            pipeline_rl_k = getattr(args, "pipeline_rl_k", None)
+            if pipeline_rl_k is not None and generation_step is not None:
+                trainer_step = worker.get_latest_trainer_step()
+                group_lag = max(0, int(trainer_step) - int(generation_step))
+                if group_lag > int(pipeline_rl_k):
+                    stale_drop_groups += 1
+                    try:
+                        reset_group = _reset_group_for_regeneration(group)
+                        with worker.data_buffer_lock:
+                            data_buffer.add_samples([reset_group])
+                        logger.info(
+                            "Dropping stale group and requeuing: "
+                            f"group_id={group_id}, trainer_step={trainer_step}, "
+                            f"generation_step={generation_step}, lag={group_lag}, k={pipeline_rl_k}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to requeue stale group {group_id}: {e}")
+                    processed_any = True
+                    continue
 
             # If any sample in the group was aborted, return the whole group to the data buffer
             # and do not forward it to the training engine.
@@ -488,7 +484,14 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
 
     data = sorted(data, key=lambda group: group[0].index)
     worker_metrics = worker.get_pipeline_rl_metrics() if hasattr(worker, "get_pipeline_rl_metrics") else {}
-    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect() | worker_metrics)
+    stale_metrics = (
+        _collect_stale_metrics(
+            stale_drop_groups=stale_drop_groups,
+        )
+        if getattr(args, "pipeline_rl_k", None) is not None
+        else {}
+    )
+    return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect() | worker_metrics | stale_metrics)
 
 
 def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation=False):

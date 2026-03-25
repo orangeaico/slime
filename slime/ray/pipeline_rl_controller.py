@@ -25,25 +25,6 @@ def get_pipeline_rl_oldest_step_gap(
     return max(0, int(trainer_step) - int(oldest_outstanding_generation_step))
 
 
-def is_pipeline_rl_update_allowed(
-    *,
-    target_trainer_step: int,
-    generation_step: int | None,
-    max_step_lead: int | None,
-) -> bool:
-    if max_step_lead is None:
-        return True
-    # The trainer should track generator progress, not the oldest lingering
-    # request that may still be draining after a weight update.
-    return (
-        get_pipeline_rl_step_lead(
-            trainer_step=target_trainer_step,
-            generation_step=generation_step,
-        )
-        < max_step_lead
-    )
-
-
 @ray.remote(num_cpus=0)
 class PipelineRLCoordinator:
     def __init__(self):
@@ -84,14 +65,3 @@ class PipelineRLCoordinator:
                 oldest_outstanding_generation_step=self.oldest_outstanding_generation_step,
             ),
         }
-
-    def is_update_allowed(self, target_trainer_step: int, max_step_lead: int | None) -> tuple[bool, dict[str, Any]]:
-        status = self.get_status()
-        return (
-            is_pipeline_rl_update_allowed(
-                target_trainer_step=target_trainer_step,
-                generation_step=status["generator_step"],
-                max_step_lead=max_step_lead,
-            ),
-            status,
-        )

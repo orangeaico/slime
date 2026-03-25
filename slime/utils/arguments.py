@@ -434,9 +434,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Approximate PipelineRL-k backlog bound for the fully-async rollout worker. "
-                    "When set, the worker avoids keeping more than k rollout batches worth of completed "
-                    "or in-flight groups ahead of the trainer. This is currently consumed by "
+                    "PipelineRL-k stale-data bound for fully async rollout. "
+                    "When set, completed groups are discarded and re-queued when "
+                    "(trainer_step - group_generation_step) > k, instead of waiting in trainer/generator. "
+                    "This is currently consumed by "
                     "examples/fully_async/fully_async_rollout.py."
                 ),
             )

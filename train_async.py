@@ -1,9 +1,7 @@
-import time
-
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
-from slime.ray.pipeline_rl_controller import PipelineRLCoordinator, get_pipeline_rl_step_lead
+from slime.ray.pipeline_rl_controller import PipelineRLCoordinator
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.misc import should_run_periodic_action
@@ -18,43 +16,6 @@ def _maybe_create_pipeline_rl_controller(args):
     if getattr(args, "pipeline_rl_k", None) is None:
         return None
     return PipelineRLCoordinator.remote()
-
-
-def _wait_for_pipeline_rl_slot(args, pipeline_rl_controller, *, target_trainer_step: int) -> None:
-    if pipeline_rl_controller is None or getattr(args, "pipeline_rl_k", None) is None:
-        return
-
-    wait_start = time.time()
-    last_log_time = wait_start
-
-    while True:
-        allowed, status = ray.get(
-            pipeline_rl_controller.is_update_allowed.remote(
-                target_trainer_step=target_trainer_step,
-                max_step_lead=args.pipeline_rl_k,
-            )
-        )
-        if allowed:
-            return
-
-        now = time.time()
-        if now - last_log_time >= 5.0:
-            projected_step_lead = get_pipeline_rl_step_lead(
-                trainer_step=target_trainer_step,
-                generation_step=status["generator_step"],
-            )
-            print(
-                "PipelineRL-k waiting: "
-                f"target_trainer_step={target_trainer_step}, "
-                f"trainer_step={status['trainer_step']}, "
-                f"generator_step={status['generator_step']}, "
-                f"current_step_lead={status['current_step_lead']}, "
-                f"projected_step_lead={projected_step_lead}/{args.pipeline_rl_k}, "
-                f"waited={now - wait_start:.1f}s",
-                flush=True,
-            )
-            last_log_time = now
-        time.sleep(0.05)
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
@@ -138,7 +99,6 @@ def train(args):
 
         if (rollout_id + 1) % args.update_weights_interval == 0:
             target_trainer_step = pipeline_trainer_step + 1
-            _wait_for_pipeline_rl_slot(args, pipeline_rl_controller, target_trainer_step=target_trainer_step)
             actor_model.update_weights()
             pipeline_trainer_step = target_trainer_step
             if pipeline_rl_controller is not None:

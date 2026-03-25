@@ -54,6 +54,5 @@ def test_compute_policy_lag_metrics_from_rollout_data_uses_current_policy_versio
 
     metrics = compute_policy_lag_metrics_from_rollout_data(rollout_data, current_policy_version=9)
 
-    assert metrics["policy_lag/mean"] == 2.5
     assert metrics["policy_lag/max"] == 4
     assert metrics["policy_version/mixed_frac"] == 0.5
