@@ -421,6 +421,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--enable-rollout-grouped-n",
+                action=argparse.BooleanOptionalAction,
+                default=False,
+                help=(
+                    "Enable grouped n-sampling rollout path. "
+                    "When disabled, rollout always uses per-sample generation."
+                ),
+            )
+            parser.add_argument(
                 "--mask-offpolicy-in-partial-rollout",
                 action="store_true",
                 default=False,

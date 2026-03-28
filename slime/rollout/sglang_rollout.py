@@ -36,6 +36,19 @@ __all__ = ["generate_rollout"]
 logger = logging.getLogger(__name__)
 
 
+def _safe_equal(left: Any, right: Any) -> bool:
+    try:
+        return left == right
+    except Exception:
+        return False
+
+
+def _prompt_to_stable_string(prompt: Any) -> str:
+    if isinstance(prompt, str):
+        return prompt
+    return repr(prompt)
+
+
 class GenerateState(metaclass=SingletonMeta):
     """
     The global state for the generation process.
@@ -105,6 +118,46 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
+async def _apply_generation_output(args: Namespace, sample: Sample, output: dict[str, Any]) -> Sample:
+    if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
+        from slime.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
+
+        sample = await postprocess_sample_with_radix_tree(args, sample, output)
+    else:
+        if "output_token_logprobs" in output["meta_info"]:
+            new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+            new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
+        else:
+            new_response_tokens, new_response_log_probs = [], []
+
+        # Update sample with tokens directly - avoiding re-tokenization
+        sample.tokens = sample.tokens + new_response_tokens
+        sample.response_length += len(new_response_tokens)
+        sample.response += output["text"]
+
+        # When partial rollout and masking off policy is enabled, update the loss mask
+        if sample.loss_mask is not None:
+            assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
+            sample.loss_mask += [1] * len(new_response_tokens)
+
+        if sample.rollout_log_probs is None:
+            sample.rollout_log_probs = []
+        sample.rollout_log_probs += new_response_log_probs
+
+    if "routed_experts" in output["meta_info"]:
+        sample.rollout_routed_experts = np.frombuffer(
+            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
+            dtype=np.int32,
+        ).reshape(
+            len(sample.tokens) - 1,
+            args.num_layers,
+            args.moe_router_topk,
+        )
+
+    sample.update_from_meta_info(args, output["meta_info"])
+    return sample
+
+
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
@@ -164,45 +217,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         headers = {"X-SMG-Routing-Key": sample.session_id}
 
     output = await post(url, payload, headers=headers)
-
-    if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
-        from slime.router.middleware_hub.radix_tree_middleware import postprocess_sample_with_radix_tree
-
-        sample = await postprocess_sample_with_radix_tree(args, sample, output)
-    else:
-        if "output_token_logprobs" in output["meta_info"]:
-            new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-        else:
-            new_response_tokens, new_response_log_probs = [], []
-
-        # Update sample with tokens directly - avoiding re-tokenization
-        sample.tokens = sample.tokens + new_response_tokens
-        sample.response_length += len(new_response_tokens)
-        sample.response += output["text"]
-
-        # When partial rollout and masking off policy is enabled, update the loss mask
-        if sample.loss_mask is not None:
-            assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
-            sample.loss_mask += [1] * len(new_response_tokens)
-
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += new_response_log_probs
-
-    if "routed_experts" in output["meta_info"]:
-        sample.rollout_routed_experts = np.frombuffer(
-            pybase64.b64decode(output["meta_info"]["routed_experts"].encode("ascii")),
-            dtype=np.int32,
-        ).reshape(
-            len(sample.tokens) - 1,
-            args.num_layers,
-            args.moe_router_topk,
-        )
-
-    sample.update_from_meta_info(args, output["meta_info"])
-
-    return sample
+    return await _apply_generation_output(args, sample, output)
 
 
 async def generate_and_rm(
@@ -270,6 +285,161 @@ async def generate_and_rm(
     return sample
 
 
+def _can_use_parallel_n_group_generation(args: Namespace, group: list[Sample], evaluation: bool) -> bool:
+    if len(group) <= 1:
+        return False
+    if evaluation:
+        return False
+    if getattr(args, "sglang_enable_deterministic_inference", False):
+        return False
+    if args.custom_generate_function_path is not None:
+        return False
+    if args.sglang_router_policy == "consistent_hashing":
+        # Grouped n-request has one routing key and cannot preserve per-sample affinity.
+        return False
+    if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
+        return False
+
+    first_prompt = _prompt_to_stable_string(group[0].prompt)
+    first_mm = group[0].multimodal_inputs
+    first_response = group[0].response
+    for sample in group:
+        if getattr(sample, "generate_function_path", None) is not None:
+            return False
+        if sample.status not in (Sample.Status.PENDING, Sample.Status.ABORTED):
+            return False
+        if _prompt_to_stable_string(sample.prompt) != first_prompt:
+            return False
+        if not _safe_equal(sample.multimodal_inputs, first_mm):
+            return False
+        # Keep this optimization to true grouped prefill only; mixed continuation states fallback.
+        if sample.response != first_response:
+            return False
+    return True
+
+
+async def _generate_group_per_sample(
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+    *,
+    evaluation: bool,
+) -> list[Sample]:
+    state = GenerateState(args)
+    tasks = []
+    for idx, sample in enumerate(group):
+        current_sampling_params = sampling_params.copy()
+        if getattr(args, "sglang_enable_deterministic_inference", False):
+            seed = state.group_sampling_seeds[idx]
+            current_sampling_params["sampling_seed"] = seed
+        tasks.append(
+            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
+        )
+    return await asyncio.gather(*tasks)
+
+
+async def _generate_group_with_parallel_n(
+    args: Namespace,
+    group: list[Sample],
+    sampling_params: dict[str, Any],
+) -> list[Sample]:
+    state = GenerateState(args)
+    url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/generate"
+    reference = group[0]
+
+    if state.processor:
+        processor_kwargs = build_processor_kwargs(reference.multimodal_inputs)
+        processor_output = state.processor(text=reference.prompt, **processor_kwargs)
+        prompt_ids = processor_output["input_ids"][0]
+        multimodal_train_inputs = {
+            k: v for k, v in processor_output.items() if k not in ["input_ids", "attention_mask"]
+        } or None
+    else:
+        prompt_ids = state.tokenizer.encode(reference.prompt, add_special_tokens=False)
+        multimodal_train_inputs = None
+
+    shared_input_ids: list[int] | None = None
+    shared_max_new_tokens: int | None = None
+    base_max_new_tokens = int(sampling_params["max_new_tokens"])
+
+    for sample in group:
+        if args.partial_rollout and args.mask_offpolicy_in_partial_rollout and sample.response_length > 0:
+            sample.loss_mask = [0] * sample.response_length
+
+        if sample.multimodal_train_inputs is None:
+            sample.multimodal_train_inputs = multimodal_train_inputs
+
+        current_max_new_tokens = base_max_new_tokens
+        if len(sample.response) > 0:
+            current_max_new_tokens -= len(sample.tokens) - len(prompt_ids)
+            current_input_ids = sample.tokens
+        else:
+            current_input_ids = prompt_ids
+            if not sample.tokens:
+                sample.tokens = prompt_ids
+
+        if current_max_new_tokens < 0:
+            raise ValueError(
+                f"max_new_tokens={current_max_new_tokens} is invalid for grouped n-generation "
+                f"(sample_index={sample.index})"
+            )
+
+        if shared_max_new_tokens is None:
+            shared_max_new_tokens = current_max_new_tokens
+        elif current_max_new_tokens != shared_max_new_tokens:
+            raise ValueError(
+                "Samples in group require different max_new_tokens during continuation; "
+                "fallback to per-sample generation."
+            )
+
+        if shared_input_ids is None:
+            shared_input_ids = list(current_input_ids)
+        elif shared_input_ids != current_input_ids:
+            raise ValueError("Samples in group have different input_ids; fallback to per-sample generation.")
+
+    assert shared_max_new_tokens is not None and shared_input_ids is not None
+    if shared_max_new_tokens == 0:
+        for sample in group:
+            sample.status = Sample.Status.TRUNCATED
+        return group
+
+    grouped_sampling_params = sampling_params.copy()
+    grouped_sampling_params["max_new_tokens"] = shared_max_new_tokens
+    grouped_sampling_params["n"] = len(group)
+
+    payload: dict[str, Any] = {
+        "sampling_params": grouped_sampling_params,
+        "return_logprob": True,
+        "input_ids": shared_input_ids,
+    }
+    if args.use_rollout_routing_replay:
+        payload["return_routed_experts"] = True
+    if reference.multimodal_inputs and reference.multimodal_inputs.get("images"):
+        payload["image_data"] = [encode_image_for_rollout_engine(image) for image in reference.multimodal_inputs["images"]]
+
+    async with state.semaphore:
+        if state.aborted:
+            for sample in group:
+                sample.status = Sample.Status.ABORTED
+            return group
+
+        with state.dp_rank_context() as _:
+            outputs = await post(url, payload)
+
+    if not isinstance(outputs, list):
+        raise TypeError(
+            "Expected list output from grouped n-generation request. "
+            f"Got {type(outputs).__name__} instead."
+        )
+    if len(outputs) != len(group):
+        raise ValueError(f"Grouped n-generation output mismatch: got {len(outputs)}, expected {len(group)}")
+
+    for sample, output in zip(group, outputs, strict=True):
+        await _apply_generation_output(args=args, sample=sample, output=output)
+
+    return group
+
+
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
@@ -283,17 +453,28 @@ async def generate_and_rm_group(
         if sample.session_id is None:
             sample.session_id = str(uuid.uuid4())
 
-    tasks = []
-    for idx, sample in enumerate(group):
-        current_sampling_params = sampling_params.copy()
-        if getattr(args, "sglang_enable_deterministic_inference", False):
-            seed = state.group_sampling_seeds[idx]
-            current_sampling_params["sampling_seed"] = seed
-        tasks.append(
-            asyncio.create_task(generate_and_rm(args, sample, current_sampling_params, evaluation=evaluation))
-        )
-
-    group = await asyncio.gather(*tasks)
+    use_grouped_n = getattr(args, "enable_rollout_grouped_n", False) and _can_use_parallel_n_group_generation(
+        args, group, evaluation=evaluation
+    )
+    if use_grouped_n:
+        try:
+            group = await _generate_group_with_parallel_n(args, group, sampling_params)
+            if not state.aborted and not args.group_rm:
+                samples_need_reward = [
+                    sample for sample in group if sample.status != Sample.Status.ABORTED and sample.reward is None
+                ]
+                if samples_need_reward:
+                    rewards = await batched_async_rm(args, samples_need_reward)
+                    for sample, reward in zip(samples_need_reward, rewards, strict=False):
+                        sample.reward = reward
+        except Exception as e:
+            logger.warning(
+                "Grouped n-generation failed; fallback to per-sample generation for this group. "
+                f"group_index={group[0].group_index if group else None}, error={type(e).__name__}: {e}"
+            )
+            group = await _generate_group_per_sample(args, group, sampling_params, evaluation=evaluation)
+    else:
+        group = await _generate_group_per_sample(args, group, sampling_params, evaluation=evaluation)
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
