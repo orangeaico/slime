@@ -108,17 +108,17 @@ RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_swe_${TIMESTAMP}_$$}
 echo "Using Ray ports: head=${RAY_HEAD_PORT}, dashboard=${RAY_DASHBOARD_PORT}"
 
 NUM_ROLLOUT=${NUM_ROLLOUT:-50}
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-2}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-2}
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-1}
+ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-4}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-4}
+N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-2}
 ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-4096}
-SWE_DOCKER_STARTUP_CONCURRENCY=${SWE_DOCKER_STARTUP_CONCURRENCY:-4}
+SWE_DOCKER_STARTUP_CONCURRENCY=${SWE_DOCKER_STARTUP_CONCURRENCY:-80}
 SWE_DOCKER_STARTUP_TIMEOUT_SECONDS=${SWE_DOCKER_STARTUP_TIMEOUT_SECONDS:-900}
 ROLLOUT_SAMPLE_FILTER_PATH=${ROLLOUT_SAMPLE_FILTER_PATH:-examples.swe_bench.rollout_hooks.mark_swe_non_submitted_samples_inactive}
 SWE_HARDCODED_RESPONSE_MODE=${SWE_HARDCODED_RESPONSE_MODE:-program}
-SWE_HARDCODED_PROGRAM_PATH=${SWE_HARDCODED_PROGRAM_PATH:-/root/repo/slime/examples/swe_bench/hardcoded_programs/hardcoded_program.yaml}
+SWE_HARDCODED_PROGRAM_PATH=${SWE_HARDCODED_PROGRAM_PATH:-/root/repo/slime/examples/swe_bench/hardcoded_programs/hardcoded_program_eval_patch.yaml}
 MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-2048}
-SWE_EVAL_REWARD_ENABLE=${SWE_EVAL_REWARD_ENABLE:-0}
+SWE_EVAL_REWARD_ENABLE=${SWE_EVAL_REWARD_ENABLE:-1}
 SWE_EVAL_LOGS_ROOT=${SWE_EVAL_LOGS_ROOT:-/root/repo/slime/outputs/swe_eval_reward_logs/${TIMESTAMP}}
 SWE_EVAL_TIMEOUT_SECONDS=${SWE_EVAL_TIMEOUT_SECONDS:-300}
 SWE_EVAL_JSONL_PATH=${SWE_EVAL_JSONL_PATH:-/root/data/swe_mirror/dataset/all_sources_combined_dataset.jsonl}
@@ -157,7 +157,7 @@ CUSTOM_ARGS=(
 
 ROLLOUT_ARGS=(
    # Prompt data for eval-reward mode uses SWE eval for all samples.
-   --prompt-data examples/swe_bench/data/train.jsonl
+   --prompt-data examples/swe_bench/data/train_mirror_patch_smoke.jsonl
    --input-key prompt
    # Don't apply chat template - we handle it in generate.py
    --rollout-shuffle

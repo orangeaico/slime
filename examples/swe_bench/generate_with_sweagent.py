@@ -13,8 +13,10 @@ import asyncio
 import copy
 import fcntl
 import os
+import shlex
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -604,6 +606,95 @@ async def _async_communicate(env: SWEEnv, command: str, timeout: int = 30, check
     return result.output
 
 
+async def _async_write_text_file(env: SWEEnv, path: str, content: str, timeout: int = 120) -> None:
+    """Write a text file inside the container using a heredoc command."""
+    payload = content if content.endswith("\n") else f"{content}\n"
+    marker = f"SLIME_PATCH_{uuid.uuid4().hex}"
+    command = (
+        f"cat > {shlex.quote(path)} <<'{marker}'\n"
+        f"{payload}"
+        f"{marker}\n"
+    )
+    await _async_communicate(env, command, timeout=timeout, check="raise")
+
+
+async def _apply_mirror_patches_if_needed(env: SWEEnv, sample: Sample) -> list[str]:
+    """Apply optional mirror_patch/test_mirror_patch from sample metadata.
+
+    Returns:
+        List of patch labels that were successfully applied.
+    """
+    metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    mirror_patch = metadata.get("mirror_patch")
+    test_mirror_patch = metadata.get("test_mirror_patch")
+
+    patches: list[tuple[str, str | None]] = [
+        ("mirror patch", mirror_patch),
+        ("test mirror patch", test_mirror_patch),
+    ]
+    if not any(patch and str(patch).strip() for _, patch in patches):
+        return []
+
+    if not env.repo or not env.repo.repo_name:
+        logger.warning("[Slime-SWE] No repo information available; skipping mirror patch application")
+        return []
+
+    repo_dir = f"/{env.repo.repo_name}"
+    applied_labels: list[str] = []
+
+    for patch_label, patch_content in patches:
+        if not patch_content or not str(patch_content).strip():
+            continue
+
+        patch_text = str(patch_content)
+        if not patch_text.endswith("\n"):
+            patch_text += "\n"
+        patch_path = f"/tmp/slime_{patch_label.replace(' ', '_')}_{uuid.uuid4().hex}.patch"
+
+        logger.info(f"[Slime-SWE] Applying {patch_label} for {metadata.get('instance_id', 'unknown')}")
+        try:
+            await _async_write_text_file(env, patch_path, patch_text, timeout=120)
+            apply_cmd = (
+                f"cd {shlex.quote(repo_dir)} && "
+                f"git apply -3 --whitespace=fix --recount {shlex.quote(patch_path)}"
+            )
+            await _async_communicate(env, apply_cmd, timeout=120, check="raise")
+            applied_labels.append(patch_label)
+            logger.info(f"[Slime-SWE] ✓ {patch_label} applied successfully")
+        except Exception as e:
+            logger.error(f"[Slime-SWE] Failed to apply {patch_label}: {e}")
+            raise
+        finally:
+            await _async_communicate(env, f"rm -f {shlex.quote(patch_path)}", check="ignore")
+
+    if not applied_labels:
+        return []
+
+    status_output = await _async_communicate(
+        env,
+        f"cd {shlex.quote(repo_dir)} && git status --porcelain",
+        timeout=30,
+        check="raise",
+    )
+    if status_output.strip():
+        commit_cmd = (
+            f"cd {shlex.quote(repo_dir)} && rm -rf .git && git init &&"
+            "git config user.email 'sweagent@example.com' && "
+            "git config user.name 'SWE Agent' && "
+            "git add -A && "
+            "git commit -m 'Apply mirror patch(es)'"
+        )
+        await _async_communicate(env, commit_cmd, timeout=60, check="raise")
+        logger.info(f"[Slime-SWE] Committed mirror patch baseline")
+    else:
+        logger.warning(
+            "[Slime-SWE] No repo changes detected after mirror patch application; "
+            "patches may already be applied or have no effect"
+        )
+
+    return applied_labels
+
+
 async def generate(args, sample: Sample, sampling_params) -> Sample:
     """Multi-turn agent loop for SWE-bench using SWE-agent infrastructure.
 
@@ -731,29 +822,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             logger.info(f"[Slime-SWE] Skipping Docker setup - using existing container")
             # Jump to agent loop execution (env and agent already set)
         else:
-            # 1. Create repo config
-            if image_name and image_name.startswith("swebench/"):
-                # Pre-built SWE-bench images have the repo at /testbed
-                repo_config = PreExistingRepoConfig(
-                    repo_name="testbed",
-                    base_commit=base_commit,
-                    reset=True,
-                )
-                working_dir = "/testbed"
-                logger.info(f"[Slime-SWE] Using pre-existing repo in SWE-bench image")
-            else:
-                # Clone from GitHub
-                if "/" in repo_name:
-                    github_url = f"https://github.com/{repo_name}"
-                else:
-                    github_url = repo_name
-
-                repo_config = GithubRepoConfig(
-                    github_url=github_url,
-                    base_commit=base_commit,
-                )
-                working_dir = f"/{repo_config.repo_name}"
-                logger.info(f"[Slime-SWE] Will clone from GitHub")
+            # 1. Create repo config:
+            # Pre-built images have the repo in /testbed
+            repo_config = PreExistingRepoConfig(
+                repo_name="testbed",
+                base_commit=base_commit,
+                reset=True,
+            )
+            working_dir = "/testbed"
+            logger.info(f"[Slime-SWE] Using pre-existing repo in SWE-bench image")
 
             # 2. Create Docker deployment config
             startup_timeout_seconds = _resolve_docker_startup_timeout_seconds(args)
@@ -812,6 +889,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 await _async_env_start(env, state)  # Pass state for abort checking
                 env_ready_for_resume = True
                 logger.info(f"[Slime-SWE] ✓ Environment ready, releasing startup slot")
+
+            # Apply mirror/test mirror patches from metadata before agent starts.
+            applied_patch_labels = await _apply_mirror_patches_if_needed(env, sample)
+            if applied_patch_labels and isinstance(sample.metadata, dict):
+                sample.metadata["mirror_patches_applied"] = applied_patch_labels
 
             # 4. Build run-specific SWE-agent config
             agent_config_run_dict = copy.deepcopy(agent_config_dict)
