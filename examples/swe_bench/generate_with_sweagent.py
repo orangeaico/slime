@@ -11,9 +11,10 @@ The integration uses a custom LLM model that queries sglang for on-policy distil
 
 import asyncio
 import copy
-import json
+import fcntl
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -40,6 +41,12 @@ from sweagent.utils.log import get_logger
 from swerex.deployment.config import DockerDeploymentConfig
 from swerex.runtime.abstract import BashAction, CreateBashSessionRequest
 
+from examples.swe_bench.hardcoded_programs.hardcoded_program_mode import HardcodedProgramRuntime
+from examples.swe_bench.rollout_hooks import (
+    is_abort_resumable_for_partial_rollout,
+    mask_previous_response_tokens,
+    should_attempt_partial_resume,
+)
 from slime.rollout.sglang_rollout import GenerateState
 from slime.utils.http_utils import post
 from slime.utils.types import Sample
@@ -58,16 +65,130 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = get_logger(__name__)
 logger.setLevel(logging.INFO)
 
-# Global lock to serialize Docker container startups
-# When multiple generate() calls run concurrently, Docker startups must be serialized
-# to avoid resource contention and runtime startup deadlocks
-_docker_startup_lock = asyncio.Lock()
+_swerex_wait_patch_applied = False
 
-# Global registry for partial rollout Docker containers
+
+def _read_pipe_nonblocking(pipe, max_bytes: int = 65536) -> str:
+    """Best-effort non-blocking read from a subprocess pipe."""
+    if pipe is None:
+        return ""
+    try:
+        fd = pipe.fileno()
+        old_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        fcntl.fcntl(fd, fcntl.F_SETFL, old_flags | os.O_NONBLOCK)
+        try:
+            data = pipe.read(max_bytes)
+        finally:
+            fcntl.fcntl(fd, fcntl.F_SETFL, old_flags)
+    except Exception:
+        return ""
+
+    if not data:
+        return ""
+    if isinstance(data, bytes):
+        return data.decode(errors="replace")
+    return str(data)
+
+
+def _apply_swerex_runtime_wait_patch() -> None:
+    """Patch SWE-ReX async wait path to avoid event-loop blocking and timeout deadlocks."""
+    global _swerex_wait_patch_applied
+    if _swerex_wait_patch_applied:
+        return
+
+    try:
+        from swerex.deployment import docker as swerex_docker_mod
+        from swerex.utils import wait as swerex_wait_mod
+    except Exception as e:
+        logger.warning(f"[Slime-SWE] Failed to import SWE-ReX patch targets: {e}")
+        return
+
+    async def _async_wait_until_alive(function, timeout: float = 10.0, function_timeout: float | None = 0.1, sleep: float = 0.25):
+        end_time = time.time() + timeout
+        n_attempts = 0
+        await_response = None
+        while time.time() < end_time:
+            await_response = await function(timeout=function_timeout)
+            if await_response:
+                return
+            await asyncio.sleep(sleep)
+            n_attempts += 1
+        last_response_message = await_response.message if await_response else None
+        msg = (
+            f"Runtime did not start within {timeout}s (tried to connect {n_attempts} times). "
+            f"The last await response was:\n{last_response_message}"
+        )
+        raise TimeoutError(msg)
+
+    async def _patched_docker_wait_until_alive(self, timeout: float = 10.0):
+        try:
+            return await _async_wait_until_alive(self.is_alive, timeout=timeout, function_timeout=self._runtime_timeout)
+        except TimeoutError as e:
+            self.logger.error("Runtime did not start within timeout. Container output (truncated).")
+            stdout_text = _read_pipe_nonblocking(getattr(self._container_process, "stdout", None))
+            stderr_text = _read_pipe_nonblocking(getattr(self._container_process, "stderr", None))
+            if stdout_text:
+                self.logger.error(stdout_text)
+            if stderr_text:
+                self.logger.error(stderr_text)
+            assert self._container_process is not None
+            await self.stop()
+            raise e
+
+    swerex_wait_mod._wait_until_alive = _async_wait_until_alive
+    swerex_docker_mod._wait_until_alive = _async_wait_until_alive
+    swerex_docker_mod.DockerDeployment._wait_until_alive = _patched_docker_wait_until_alive
+    _swerex_wait_patch_applied = True
+    logger.info("[Slime-SWE] Applied SWE-ReX async wait/deadlock patch")
+
+
+_apply_swerex_runtime_wait_patch()
+
+# Startup limiter for Docker container boots.
+# We keep this configurable so rollout can run multiple starts in parallel
+# while still allowing users to cap startup pressure on shared machines.
+_docker_startup_semaphore = None
+_docker_startup_concurrency = None
+
+# Global registry for partial rollout Docker containers.
 # Maps session_id -> {"env": SWEEnv, "agent": DefaultAgent, "instance_id": str, "rollout_id": int, "timestamp": float}
-# Uses session_id (unique per sample) instead of instance_id to support n-samples-per-prompt > 1
-# Note: No lock needed - asyncio event loop serializes access automatically
+# Note: No lock needed - asyncio event loop serializes access automatically.
 _partial_rollout_containers = {}
+
+
+def _resolve_docker_startup_concurrency(args) -> int:
+    """Resolve startup parallelism for SWE Docker environments."""
+    raw_value = getattr(args, "swe_docker_startup_concurrency", 4)
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError):
+        value = 4
+    return max(1, value)
+
+
+def _get_docker_startup_semaphore(args) -> asyncio.Semaphore:
+    """Get/create startup semaphore with current configured concurrency."""
+    global _docker_startup_semaphore, _docker_startup_concurrency
+
+    concurrency = _resolve_docker_startup_concurrency(args)
+    if _docker_startup_semaphore is None or _docker_startup_concurrency != concurrency:
+        _docker_startup_concurrency = concurrency
+        _docker_startup_semaphore = asyncio.Semaphore(concurrency)
+        logger.info(
+            f"[Slime-SWE] Docker startup concurrency configured: {_docker_startup_concurrency}"
+        )
+
+    return _docker_startup_semaphore
+
+
+def _resolve_docker_startup_timeout_seconds(args) -> float:
+    """Resolve SWE Docker startup timeout in seconds."""
+    raw_value = getattr(args, "swe_docker_startup_timeout_seconds", 900)
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        value = 900.0
+    return max(30.0, value)
 
 
 async def cleanup_partial_rollout_containers(max_age_hours: float = 1.0):
@@ -162,6 +283,9 @@ class SlimeLLMModel(AbstractModel):
         self.sglang_url = None  # Will be set from args
         self.sglang_model_name = None  # Will be set from args
         self.tokenizer = None  # Will be set from state
+        self.sample_session_id: str | None = None
+        self.sample_instance_id: str | None = None
+        self._hardcoded_program_runtime = HardcodedProgramRuntime(logger=self.logger)
 
     def reset_stats(self):
         """Reset statistics for a new instance."""
@@ -182,28 +306,42 @@ class SlimeLLMModel(AbstractModel):
         Returns:
             dict with 'message' key containing the LLM response text
         """
-        # HARDCODED RESPONSE FOR DEBUGGING
-        # Check if hardcoded response file exists
-        hardcoded_response_path = Path("/root/repo/slime/examples/swe_bench/hardcoded_response_none.txt")
-        if hardcoded_response_path.exists():
-            self.logger.info(f"[SlimeLLM] Using hardcoded response from {hardcoded_response_path}")
-
-            # Check for abort before returning hardcoded response
+        hardcoded_mode = str(getattr(self.args, "swe_hardcoded_response_mode", "none")).strip().lower()
+        if hardcoded_mode == "program":
             from slime.rollout.sglang_rollout import GenerateState
+
             state = GenerateState(self.args)
             if state.aborted:
                 self.logger.info(f"[SlimeLLM] ⚠ Request aborted, raising AbortedException")
                 raise AbortedException("LLM request aborted by server")
 
-            with open(hardcoded_response_path, 'r') as f:
-                hardcoded_message = f.read().strip()
+            hardcoded_program_path = Path(
+                getattr(
+                    self.args,
+                    "swe_hardcoded_program_path",
+                    "/root/repo/slime/examples/swe_bench/hardcoded_programs/hardcoded_program.yaml",
+                )
+            )
+            turn = self.stats.api_calls + 1
+            session_id = self.sample_session_id or f"session_{id(self)}"
+            instance_id = self.sample_instance_id or "unknown_instance"
+            hardcoded_message = self._hardcoded_program_runtime.build_message(
+                program_path=hardcoded_program_path,
+                session_id=session_id,
+                instance_id=instance_id,
+                turn=turn,
+            )
 
-            # Update stats
             self.stats.api_calls += 1
             self.logger.debug(f"[SlimeLLM] Total API calls: {self.stats.api_calls}")
             self.logger.debug(f"[SlimeLLM] Hardcoded response length: {len(hardcoded_message)} chars")
-
             return {"message": hardcoded_message}
+
+        if hardcoded_mode not in {"", "none"}:
+            raise ValueError(
+                f"Unsupported swe_hardcoded_response_mode={hardcoded_mode!r}. "
+                "Use one of: none, program."
+            )
 
         # Normal flow if no hardcoded response
         # Convert history to messages format
@@ -491,6 +629,35 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     base_commit = sample.metadata.get("base_commit", "HEAD")
     image_name = sample.metadata.get("image_name", None)
     problem_statement = sample.prompt
+    problem_stmt = TextProblemStatement(
+        id=instance_id,
+        text=problem_statement,
+    )
+    output_dir = Path("/root/repo/slime/outputs/swe_agent_trajectories") / instance_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Load shared agent config once so both fresh and resumed paths have turn budget.
+    config_path = Path("/root/swe_livup/config/test_xml_v2.yaml")
+    with open(config_path) as f:
+        swe_config_yaml = yaml.safe_load(f)
+    agent_config_dict = swe_config_yaml.get("agent", {})
+    model_config_dict = agent_config_dict.get("model", {}) if isinstance(agent_config_dict, dict) else {}
+    max_turns = int((
+        model_config_dict.get("per_instance_call_limit")
+        if isinstance(model_config_dict, dict)
+        else None
+    ))
+    previous_turns_used = max(
+        0,
+        int(
+            sample.metadata.get(
+                "swe_turns_used",
+                sample.metadata.get("total_turn_count", sample.metadata.get("turn_count", 0)),
+            )
+            or 0
+        ),
+    )
+    prior_response_length = int(getattr(sample, "response_length", 0) or 0)
 
     # Generate unique session_id if not present (for container tracking)
     if sample.session_id is None:
@@ -501,17 +668,25 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     env = None
     agent = None
     resuming_partial = False
+    env_ready_for_resume = False
+    agent_ready_for_resume = False
+    system_prompt = None
+    instance_prompt = None
 
-    if args.partial_rollout and sample.session_id in _partial_rollout_containers:
+    if should_attempt_partial_resume(args, sample) and sample.session_id in _partial_rollout_containers:
         container_info = _partial_rollout_containers[sample.session_id]
         env = container_info["env"]
         agent = container_info["agent"]
+        if hasattr(agent, "model"):
+            agent.model.sample_session_id = sample.session_id
+            agent.model.sample_instance_id = instance_id
 
         logger.info(
             f"[Slime-SWE] Resuming from partial rollout: {instance_id} "
             f"(session: {sample.session_id[:8]}, "
             f"previous rollout: {container_info['rollout_id']}, "
-            f"existing response length: {sample.response_length})"
+            f"existing response length: {sample.response_length}, "
+            f"used_turns={previous_turns_used}/{max_turns})"
         )
 
         # Remove from registry - we'll re-add if it becomes partial again
@@ -525,6 +700,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 raise RuntimeError("Container health check failed - unexpected output")
 
             resuming_partial = True
+            env_ready_for_resume = True
             logger.info(f"[Slime-SWE] ✓ Container health check passed")
         except Exception as e:
             logger.warning(
@@ -580,20 +756,27 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 logger.info(f"[Slime-SWE] Will clone from GitHub")
 
             # 2. Create Docker deployment config
+            startup_timeout_seconds = _resolve_docker_startup_timeout_seconds(args)
             if image_name:
                 deployment_config = DockerDeploymentConfig(
                     image=image_name,
                     pull="never",
-                    startup_timeout=300.0,
+                    startup_timeout=startup_timeout_seconds,
                     python_standalone_dir=None,
                 )
-                logger.info(f"[Slime-SWE] Using Docker image: {image_name}")
+                logger.info(
+                    f"[Slime-SWE] Using Docker image: {image_name} "
+                    f"(startup_timeout={startup_timeout_seconds:.0f}s)"
+                )
             else:
                 deployment_config = DockerDeploymentConfig(
                     image="python:3.11",
-                    startup_timeout=300.0,
+                    startup_timeout=startup_timeout_seconds,
                 )
-                logger.warning(f"[Slime-SWE] No image_name, using default python:3.11")
+                logger.warning(
+                    f"[Slime-SWE] No image_name, using default python:3.11 "
+                    f"(startup_timeout={startup_timeout_seconds:.0f}s)"
+                )
 
             env_config = EnvironmentConfig(
                 repo=repo_config,
@@ -610,36 +793,38 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 sample.status = Sample.Status.ABORTED
                 return sample
 
-            # Serialize Docker container startups to prevent concurrent health check deadlocks
-            logger.info(f"[Slime-SWE] Waiting for Docker startup lock...")
-            async with _docker_startup_lock:
-                # Check abort again after acquiring lock (might have been aborted while waiting)
+            startup_limiter = _get_docker_startup_semaphore(args)
+            logger.info(
+                f"[Slime-SWE] Waiting for Docker startup slot "
+                f"(limit={_docker_startup_concurrency})..."
+            )
+            async with startup_limiter:
+                # Check abort again after acquiring slot (might have been aborted while waiting)
                 if state.aborted:
-                    logger.info(f"[Slime-SWE] ⚠ Abort detected after acquiring lock, skipping startup")
+                    logger.info(f"[Slime-SWE] ⚠ Abort detected after acquiring startup slot, skipping startup")
                     sample.status = Sample.Status.ABORTED
                     return sample
 
-                logger.info(f"[Slime-SWE] Lock acquired, starting environment...")
+                logger.info(
+                    f"[Slime-SWE] Startup slot acquired for {instance_id} "
+                    f"(session: {sample.session_id[:8]})"
+                )
                 await _async_env_start(env, state)  # Pass state for abort checking
-                logger.info(f"[Slime-SWE] ✓ Environment ready, releasing lock")
+                env_ready_for_resume = True
+                logger.info(f"[Slime-SWE] ✓ Environment ready, releasing startup slot")
 
-            # 4. Load SWE-agent configuration from YAML
-            config_path = Path("/root/swe_livup/config/test_xml_v2.yaml")
-            with open(config_path) as f:
-                swe_config_yaml = yaml.safe_load(f)
-
-            # Parse agent config
-            agent_config_dict = swe_config_yaml.get("agent", {})
+            # 4. Build run-specific SWE-agent config
+            agent_config_run_dict = copy.deepcopy(agent_config_dict)
 
             # Override model config with sglang settings
-            agent_config_dict["model"] = {
+            agent_config_run_dict["model"] = {
                 "name": "sglang",
                 "temperature": sampling_params.get("temperature", 0.7) if isinstance(sampling_params, dict) else 0.7,
                 "top_p": sampling_params.get("top_p", 1.0) if isinstance(sampling_params, dict) else 1.0,
             }
 
             # Create DefaultAgentConfig from YAML
-            agent_config = DefaultAgentConfig(**agent_config_dict)
+            agent_config = DefaultAgentConfig(**agent_config_run_dict)
 
             logger.debug(f"[Slime-SWE] Loaded agent config from YAML")
 
@@ -650,6 +835,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             model.sglang_url = f"http://{args.sglang_router_ip}:{args.sglang_router_port}/v1/chat/completions"
             model.sglang_model_name = "/root/data/hf_models/Qwen3-1.7B"
             model.tokenizer = state.tokenizer
+            model.sample_session_id = sample.session_id
+            model.sample_instance_id = instance_id
 
             logger.debug(f"[Slime-SWE] Created SlimeLLMModel")
 
@@ -684,26 +871,11 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
             logger.debug(f"[Slime-SWE] Built system and instance prompts")
 
-            # 8. Manual agent initialization (avoid asyncio.run() conflict)
-            problem_stmt = TextProblemStatement(
-                id=instance_id,
-                text=problem_statement,
-            )
-
-            output_dir = Path("/root/repo/slime/outputs/swe_agent_trajectories") / instance_id
-            output_dir.mkdir(parents=True, exist_ok=True)
-
             logger.debug(f"[Slime-SWE] Setting up agent for background thread execution...")
-
-            # Build initial messages for later use in tokenization
-            setup_messages = [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": instance_prompt}
-            ]
 
         # Define the agent loop function that runs in a separate thread
         # This allows swe-agent to use asyncio.run() freely without conflicts
-        def run_agent_loop_sync(system_prompt_arg: str, instance_prompt_arg: str, max_turns: int):
+        def run_agent_loop_sync(system_prompt_arg: str | None, instance_prompt_arg: str | None, max_turns: int):
             """Run the agent loop in a synchronous context (separate thread).
 
             Args:
@@ -711,6 +883,8 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                 instance_prompt_arg: Instance-specific prompt
                 max_turns: Maximum number of turns to run
             """
+            nonlocal agent_ready_for_resume
+
             # Set agent state (replaces agent.setup() which uses asyncio.run())
             agent._env = env
             agent._problem_statement = problem_stmt
@@ -720,36 +894,47 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             agent.traj_path = output_dir / f"{instance_id}.traj"
             logger.debug(f"[Slime-SWE] Trajectory will be saved to: {agent.traj_path}")
 
-            # CRITICAL: Install tools to make commands like str_replace_editor available
-            # This adds tool bin directories to PATH in the container
-            logger.debug(f"[Slime-SWE] Installing agent tools (this adds bins to PATH)...")
-            try:
-                agent.tools.install(env)
-                logger.info(f"[Slime-SWE] ✓ Tools installed successfully")
-            except Exception as e:
-                logger.error(f"[Slime-SWE] ✗ Failed to install tools: {e}")
-                logger.exception(e)
-                raise
+            if resuming_partial:
+                agent_ready_for_resume = True
+                logger.info(
+                    f"[Slime-SWE] Continuing resumed agent state "
+                    f"(history_len={len(agent.history) if hasattr(agent, 'history') else 'unknown'})"
+                )
+            else:
+                # CRITICAL: Install tools to make commands like str_replace_editor available
+                # This adds tool bin directories to PATH in the container
+                logger.debug(f"[Slime-SWE] Installing agent tools (this adds bins to PATH)...")
+                try:
+                    agent.tools.install(env)
+                    logger.info(f"[Slime-SWE] ✓ Tools installed successfully")
+                except Exception as e:
+                    logger.error(f"[Slime-SWE] ✗ Failed to install tools: {e}")
+                    logger.exception(e)
+                    raise
 
-            # Initialize history with system and instance prompts as HistoryItem entries
-            agent.history = [
-                {
-                    "role": "system",
-                    "content": system_prompt_arg,
-                    "message_type": "observation",
-                    "agent": agent.name,
-                },
-                {
-                    "role": "user",
-                    "content": instance_prompt_arg,
-                    "message_type": "observation",
-                    "agent": agent.name,
-                },
-            ]
-            # Reset model stats for this instance
-            agent.model.reset_stats()
+                if system_prompt_arg is None or instance_prompt_arg is None:
+                    raise RuntimeError("Missing prompts for fresh agent initialization")
 
-            logger.info(f"[Slime-SWE] ✓ Agent initialized in background thread, starting multi-turn loop")
+                # Initialize history with system and instance prompts as HistoryItem entries
+                agent.history = [
+                    {
+                        "role": "system",
+                        "content": system_prompt_arg,
+                        "message_type": "observation",
+                        "agent": agent.name,
+                    },
+                    {
+                        "role": "user",
+                        "content": instance_prompt_arg,
+                        "message_type": "observation",
+                        "agent": agent.name,
+                    },
+                ]
+                # Reset model stats for this instance
+                agent.model.reset_stats()
+                agent_ready_for_resume = True
+                logger.info(f"[Slime-SWE] ✓ Agent initialized in background thread, starting multi-turn loop")
+
             logger.info(f"[Slime-SWE] Max turns: {max_turns}")
 
             # Run agent loop
@@ -757,6 +942,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
             aborted = False
 
             while turn_count < max_turns:
+                if state.aborted:
+                    logger.info(
+                        f"[Slime-SWE] ⚠ Abort flag detected before turn {turn_count + 1}, stopping agent loop"
+                    )
+                    aborted = True
+                    break
+
                 try:
                     logger.info(f"[Slime-SWE] ========== Turn {turn_count + 1}/{max_turns} ==========")
                     logger.debug(f"[Slime-SWE] History length before step: {len(agent.history)} items")
@@ -771,6 +963,13 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
                     turn_count += 1
 
+                    if state.aborted:
+                        logger.info(
+                            f"[Slime-SWE] ⚠ Abort flag detected after turn {turn_count}, marking sample as partial"
+                        )
+                        aborted = True
+                        break
+
                     # Check if done
                     if step_output.done:
                         logger.info(f"[Slime-SWE] ✓ Agent signaled completion at turn {turn_count}")
@@ -783,8 +982,15 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     break
 
                 except Exception as e:
-                    logger.error(f"[Slime-SWE] ✗ Error in turn {turn_count + 1}: {type(e).__name__}: {e}")
-                    logger.exception(e)
+                    if state.aborted:
+                        logger.info(
+                            f"[Slime-SWE] ⚠ Exception after abort signal at turn {turn_count + 1}: "
+                            f"{type(e).__name__}: {e}"
+                        )
+                        aborted = True
+                    else:
+                        logger.error(f"[Slime-SWE] ✗ Error in turn {turn_count + 1}: {type(e).__name__}: {e}")
+                        logger.exception(e)
                     break
 
             # Save trajectory
@@ -799,27 +1005,36 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
             return turn_count, aborted
 
-        # 8. Run agent loop in a separate thread to avoid event loop conflicts
+        # 8. Run agent loop in a separate thread without blocking the asyncio event loop
         # This is the key: swe-agent expects to run in a sync context, so we give it one
         logger.debug(f"[Slime-SWE] Running agent loop in background thread (swe-agent needs sync context)")
 
-        max_turns = agent_config_dict.get("max_turns", 5)
-        logger.info(f"[Slime-SWE] Configuration: max_turns={max_turns}, temperature={sampling_params.get('temperature', 0.7) if isinstance(sampling_params, dict) else 0.7}")
+        remaining_turn_budget = max(0, max_turns - previous_turns_used)
+        logger.info(
+            f"[Slime-SWE] Configuration: total_max_turns={max_turns}, "
+            f"previous_turns={previous_turns_used}, current_turn_budget={remaining_turn_budget}, "
+            f"temperature={sampling_params.get('temperature', 0.7) if isinstance(sampling_params, dict) else 0.7}"
+        )
 
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(run_agent_loop_sync, system_prompt, instance_prompt, max_turns)
-            turn_count, aborted = future.result()  # Wait for completion
+        if remaining_turn_budget > 0:
+            loop = asyncio.get_running_loop()
+            turn_count, aborted = await loop.run_in_executor(
+                None,
+                run_agent_loop_sync,
+                system_prompt,
+                instance_prompt,
+                remaining_turn_budget,
+            )
+        else:
+            logger.info(
+                f"[Slime-SWE] Turn budget already exhausted for {instance_id} "
+                f"({previous_turns_used}/{max_turns}); skipping further agent turns."
+            )
+            turn_count, aborted = 0, False
 
         logger.info(f"[Slime-SWE] ✓ Agent loop completed in background thread ({turn_count} turns, aborted={aborted})")
 
-        # Check if agent loop was aborted (following pattern from examples/search-r1/generate_with_search.py)
-        if aborted:
-            logger.info(f"[Slime-SWE] ⚠ Agent loop was aborted, marking sample as ABORTED")
-            sample.status = Sample.Status.ABORTED
-            return sample
-
-        # 10. Extract trajectory data
+        # 10. Extract trajectory data (also for aborted runs so partial state can be resumed)
         logger.info(f"[Slime-SWE] Extracting trajectory data...")
         traj_data = agent.get_trajectory_data()
         trajectory = traj_data["trajectory"]
@@ -891,18 +1106,21 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         # This is different from SFT dataset format which covers the entire sequence
         response_start_idx = len(prompt_tokens)
         loss_mask = full_loss_mask[response_start_idx:]  # Only response tokens
+        if resuming_partial and args.mask_offpolicy_in_partial_rollout and prior_response_length > 0:
+            # Keep only newly generated tokens trainable after resume.
+            # The prefix corresponds to tokens generated before this rollout step.
+            loss_mask = mask_previous_response_tokens(loss_mask, prior_response_length)
 
         logger.info(f"[Slime-SWE] Total tokens: {len(full_tokens)}, Prompt tokens: {len(prompt_tokens)}, Response tokens: {len(full_tokens) - len(prompt_tokens)}, Loss mask length (response only): {len(loss_mask)}")
 
         # 12. Extract final patch
-        logger.info(f"[Slime-SWE] Extracting final git diff patch...")
-        try:
-            patch = await _async_communicate(env, "git diff", timeout=10, check="ignore")
-            sample.metadata["patch"] = patch
-            logger.info(f"[Slime-SWE] ✓ Extracted patch: {len(patch)} chars")
-        except Exception as e:
-            logger.error(f"[Slime-SWE] ✗ Failed to extract patch: {e}")
-            sample.metadata["patch"] = info.get("submission", "")
+        logger.info(f"[Slime-SWE] Extracting final patch...")
+        patch = info.get("submission", "") if isinstance(info, dict) else ""
+
+        sample.metadata["patch"] = patch
+        logger.info(
+            f"[Slime-SWE] ✓ Extracted patch: {len(patch)} chars)"
+        )
 
         # 13. Store in sample
         logger.info(f"[Slime-SWE] Preparing final sample...")
@@ -914,24 +1132,59 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
         response_tokens = full_tokens[len(prompt_tokens):]
         response_text = state.tokenizer.decode(response_tokens, skip_special_tokens=False)
 
+        # If rollout-level abort was signaled while this sample was still in-flight,
+        # keep non-submitted responses resumable instead of finalizing as completed.
+        exit_status = str(info.get("exit_status", "")).strip().lower() if isinstance(info, dict) else ""
+        rollout_abort_for_partial_resume = (
+            state.aborted
+            and not aborted
+            and len(response_tokens) > 0
+            and "submitted" not in exit_status
+        )
+        if rollout_abort_for_partial_resume:
+            logger.info(
+                f"[Slime-SWE] Rollout abort signal: converting in-flight non-submitted sample "
+                f"to ABORTED for partial resume: {instance_id} (exit_status={exit_status!r})"
+            )
+            aborted = True
+
         sample.tokens = full_tokens
         sample.response_length = len(response_tokens)
         sample.response = response_text
         sample.loss_mask = loss_mask
         sample.prompt = prompt_text
-        sample.status = Sample.Status.COMPLETED
+        sample.status = Sample.Status.ABORTED if aborted else Sample.Status.COMPLETED
 
         # Store trajectory in metadata for later analysis
         sample.metadata["trajectory"] = trajectory
         sample.metadata["info"] = info
+        total_turn_count = previous_turns_used + turn_count
         sample.metadata["turn_count"] = turn_count
+        sample.metadata["total_turn_count"] = total_turn_count
+        sample.metadata["swe_turns_used"] = total_turn_count
+        sample.metadata["swe_max_turns"] = max_turns
+        sample.metadata["swe_turn_budget_remaining"] = max(0, max_turns - total_turn_count)
+        sample.metadata["swe_turn_budget_exhausted"] = total_turn_count >= max_turns
+        sample.metadata["aborted_in_agent_loop"] = aborted
+        sample.metadata["rollout_abort_for_partial_resume"] = rollout_abort_for_partial_resume
+        sample.metadata["resume_ready"] = is_abort_resumable_for_partial_rollout(
+            sample,
+            exit_status=exit_status,
+            total_turn_count=total_turn_count,
+            max_turns=max_turns,
+        )
 
         # Calculate training token statistics
         trainable_tokens = sum(loss_mask)
         masked_tokens = len(loss_mask) - trainable_tokens
 
         logger.info(f"[Slime-SWE] ✓ Sample prepared successfully:")
-        logger.info(f"[Slime-SWE]   - Total tokens: {len(sample.tokens)}, Prompt tokens: {len(prompt_tokens)}, Response tokens: {sample.response_length}, Loss mask length (response only): {len(loss_mask)}, Trainable tokens: {trainable_tokens}, Masked tokens: {masked_tokens}, Turns: {turn_count}")
+        logger.info(
+            f"[Slime-SWE]   - Status: {sample.status.value}, "
+            f"Total tokens: {len(sample.tokens)}, Prompt tokens: {len(prompt_tokens)}, "
+            f"Response tokens: {sample.response_length}, Loss mask length (response only): {len(loss_mask)}, "
+            f"Trainable tokens: {trainable_tokens}, Masked tokens: {masked_tokens}, Turns: {turn_count}"
+        )
 
         # 14. Dump sample to outputs directory for inspection
         try:
@@ -953,6 +1206,10 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
                     "instance_id": instance_id,
                     "status": str(sample.status),
                     "turn_count": turn_count,
+                    "total_turn_count": total_turn_count,
+                    "swe_max_turns": max_turns,
+                    "swe_turn_budget_remaining": max(0, max_turns - total_turn_count),
+                    "swe_turn_budget_exhausted": total_turn_count >= max_turns,
                     "repo": sample.metadata.get("repo", ""),
                     "base_commit": sample.metadata.get("base_commit", ""),
                     "problem_statement": sample.metadata.get("problem_statement", ""),
@@ -1044,22 +1301,30 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
     finally:
         # Handle environment cleanup based on sample status
         if env is not None:
+            info = sample.metadata.get("info") if isinstance(sample.metadata, dict) else None
+            exit_status = str(info.get("exit_status", "")).strip().lower() if isinstance(info, dict) else ""
+
             # Check if this sample should be kept alive for partial rollout resumption
             should_keep_alive = (
                 args.partial_rollout
-                and sample.status == Sample.Status.ABORTED
                 and sample.response
                 and len(sample.response) > 0
+                and env_ready_for_resume
+                and agent is not None
+                and agent_ready_for_resume
+                and bool(sample.metadata.get("resume_ready", False))
             )
 
             if should_keep_alive:
                 # Save environment and agent for next rollout
                 import time
 
+                sample.metadata["resume_ready"] = True
                 logger.info(
                     f"[Slime-SWE] Keeping Docker container alive for partial rollout: "
                     f"{instance_id} (session: {sample.session_id[:8]}, "
-                    f"response_length={sample.response_length})"
+                    f"response_length={sample.response_length}, status={sample.status.value}, "
+                    f"exit_status={exit_status})"
                 )
 
                 # Store in global registry using session_id (unique per sample)
