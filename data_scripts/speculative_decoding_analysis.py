@@ -78,6 +78,7 @@ class HitRatioResult:
     total_speculated: int  # Total number of tokens speculated
     total_context_length: int  # Sum of longest matching context lengths
     total_candidates: int  # Total number of candidate matches found
+    total_target_tokens: int = 0  # Total tokens to generate (target length - context_size)
     hit_lengths: dict[int, int] = field(default_factory=dict)  # Distribution of hit lengths: length -> count
 
     @property
@@ -114,6 +115,24 @@ class HitRatioResult:
         if self.matched_positions == 0:
             return 0.0
         return self.total_candidates / self.matched_positions
+
+    @property
+    def speedup(self) -> float:
+        """
+        Speedup compared to non-speculative generation.
+
+        Speedup = (total tokens to generate) / (total generation steps needed)
+
+        Logic:
+        - Without speculation: Need 1 generation step per token = total_target_tokens steps
+        - With speculation: Need total_positions steps (some steps generate multiple tokens)
+        - Speedup shows how many times faster speculative decoding is
+
+        Example: If speedup = 2.0, speculative decoding is 2x faster
+        """
+        if self.total_positions == 0:
+            return 0.0
+        return self.total_target_tokens / self.total_positions
 
 
 # =============================================================================
@@ -343,6 +362,10 @@ def calculate_hit_ratio(
     1. Find a matching context (minimum context_size) in the draft
     2. If found, speculate the next k tokens from the draft
     3. Count how many of these match the actual target tokens
+    4. Skip forward by the number of accepted tokens (or 1 if none accepted)
+
+    This simulates the actual behavior of speculative decoding where accepted
+    tokens are skipped, avoiding redundant speculation attempts.
 
     Args:
         draft_tokens: Token IDs from the draft response
@@ -357,6 +380,9 @@ def calculate_hit_ratio(
     # Build n-gram index only for minimum context size
     draft_index = build_ngram_index(draft_tokens, context_size)
 
+    # Total tokens to generate (excluding initial context)
+    total_target_tokens = max(0, len(target_tokens) - context_size)
+
     total_positions = 0
     context_found_positions = 0
     matched_positions = 0
@@ -370,7 +396,9 @@ def calculate_hit_ratio(
     match_fn = find_longest_match if use_longest_match else find_first_match
 
     # Iterate through target positions where we can attempt speculation
-    for pos in range(context_size, len(target_tokens)):
+    # Skip positions based on accepted speculative tokens
+    pos = context_size
+    while pos < len(target_tokens):
         total_positions += 1
 
         # Find matching context
@@ -380,6 +408,8 @@ def calculate_hit_ratio(
         )
 
         if match is None:
+            # No match found, move forward by 1
+            pos += 1
             continue
 
         draft_pos, ctx_len, num_candidates = match
@@ -391,6 +421,8 @@ def calculate_hit_ratio(
         speculated_tokens = draft_tokens[spec_start:spec_end]
 
         if not speculated_tokens:
+            # Context was found but no tokens to speculate, move forward by 1
+            pos += 1
             continue
 
         # Context was found and we have tokens to speculate
@@ -414,6 +446,14 @@ def calculate_hit_ratio(
         total_hits += hits
         hit_lengths[hits] += 1
 
+        # Move forward based on accepted tokens
+        if hits > 0:
+            # Skip positions covered by accepted speculative tokens
+            pos += hits
+        else:
+            # No tokens accepted, move by 1
+            pos += 1
+
     return HitRatioResult(
         total_positions=total_positions,
         context_found_positions=context_found_positions,
@@ -422,6 +462,7 @@ def calculate_hit_ratio(
         total_speculated=total_speculated,
         total_context_length=total_context_length,
         total_candidates=total_candidates,
+        total_target_tokens=total_target_tokens,
         hit_lengths=dict(hit_lengths),
     )
 
@@ -452,7 +493,7 @@ class AggregatedResults:
     total_speculated: int
     total_context_length: int
     total_candidates: int = 0
-    per_instance_hit_ratios: list[float] = field(default_factory=list)
+    total_target_tokens: int = 0
     hit_lengths: dict[int, int] = field(default_factory=dict)  # Distribution of hit lengths
 
     @property
@@ -461,13 +502,6 @@ class AggregatedResults:
         if self.total_speculated == 0:
             return 0.0
         return self.total_hits / self.total_speculated
-
-    @property
-    def avg_hit_ratio(self) -> float:
-        """Average hit ratio per instance."""
-        if not self.per_instance_hit_ratios:
-            return 0.0
-        return sum(self.per_instance_hit_ratios) / len(self.per_instance_hit_ratios)
 
     @property
     def context_found_rate(self) -> float:
@@ -496,6 +530,24 @@ class AggregatedResults:
         if self.total_matched_positions == 0:
             return 0.0
         return self.total_candidates / self.total_matched_positions
+
+    @property
+    def overall_speedup(self) -> float:
+        """
+        Overall speedup compared to non-speculative generation.
+
+        Speedup = (total tokens to generate) / (total generation steps needed)
+
+        Logic:
+        - Without speculation: Need 1 generation step per token = total_target_tokens steps
+        - With speculation: Need total_positions steps (some steps generate multiple tokens)
+        - Speedup shows how many times faster speculative decoding is
+
+        Example: If speedup = 2.0, speculative decoding is 2x faster
+        """
+        if self.total_positions == 0:
+            return 0.0
+        return self.total_target_tokens / self.total_positions
 
 
 def analyze_instance(
@@ -572,6 +624,7 @@ def run_analysis(
         total_speculated=0,
         total_context_length=0,
         total_candidates=0,
+        total_target_tokens=0,
     )
 
     for instance_id, instance in instances.items():
@@ -588,6 +641,7 @@ def run_analysis(
         instance_matched = sum(r.matched_positions for r in instance_results)
         instance_context_len = sum(r.total_context_length for r in instance_results)
         instance_candidates = sum(r.total_candidates for r in instance_results)
+        instance_target_tokens = sum(r.total_target_tokens for r in instance_results)
 
         # Aggregate hit_lengths distribution
         for result in instance_results:
@@ -595,10 +649,6 @@ def run_analysis(
                 if hit_len not in aggregated.hit_lengths:
                     aggregated.hit_lengths[hit_len] = 0
                 aggregated.hit_lengths[hit_len] += count
-
-        if instance_speculated > 0:
-            instance_hit_ratio = instance_hits / instance_speculated
-            aggregated.per_instance_hit_ratios.append(instance_hit_ratio)
 
         aggregated.num_instances += 1
         aggregated.num_comparisons += len(instance_results)
@@ -609,6 +659,7 @@ def run_analysis(
         aggregated.total_speculated += instance_speculated
         aggregated.total_context_length += instance_context_len
         aggregated.total_candidates += instance_candidates
+        aggregated.total_target_tokens += instance_target_tokens
 
     return aggregated
 
@@ -626,13 +677,14 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
     print("-" * 80)
 
     print(f"\nOverall Metrics:")
-    print(f"  Hit Ratio (overall):        {results.overall_hit_ratio:.4f}")
-    print(f"  Hit Ratio (avg/instance):   {results.avg_hit_ratio:.4f}")
+    print(f"  Speedup:                    {results.overall_speedup:.4f}x")
+    print(f"  Hit Ratio:                  {results.overall_hit_ratio:.4f}")
     print(f"  Context found rate:         {results.context_found_rate:.4f}")
     print(f"  Usable context rate:        {results.match_rate:.4f}")
     print(f"  Avg context length:         {results.avg_context_length:.2f}")
     print(f"  Instances analyzed:         {results.num_instances}")
     print(f"  Total comparisons:          {results.num_comparisons}")
+    print(f"  Total target tokens:        {results.total_target_tokens}")
     print(f"  Total positions evaluated:  {results.total_positions}")
 
     print(f"\nHit Length Distribution (for k={config.k}):")
@@ -652,11 +704,13 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
 
     print("\n" + "=" * 80)
     print("Metrics explanation:")
-    print("  - Hit Ratio: Fraction of speculated tokens that matched (overall)")
-    print("  - Avg/Instance: Average hit ratio per instance")
-    print("  - Context found rate: Fraction of positions where context was found (regardless of tokens to speculate)")
-    print("  - Usable context rate: Fraction of positions where context was found AND tokens were available to speculate")
+    print("  - Speedup: How many times faster than non-speculative generation")
+    print("    Formula: (total target tokens) / (total positions evaluated)")
+    print("  - Hit Ratio: Fraction of speculated tokens that matched")
+    print("  - Context found rate: Fraction of evaluated positions where context was found (regardless of tokens to speculate)")
+    print("  - Usable context rate: Fraction of evaluated positions where context was found AND tokens were available to speculate")
     print("  - Avg context length: Average longest matching context length per usable match (tokens)")
+    print("  - Total positions evaluated: Positions where speculation was attempted (skips accepted tokens)")
     print("  - Hit length distribution: Cumulative count of cases where >= N consecutive tokens matched")
     print("    (e.g., 'Length 3' shows how many cases had >= 3 tokens matching)")
     print("")
@@ -686,8 +740,9 @@ def save_results(
             "total_speculated": results.total_speculated,
             "total_context_length": results.total_context_length,
             "total_candidates": results.total_candidates,
-            "overall_hit_ratio": results.overall_hit_ratio,
-            "avg_hit_ratio": results.avg_hit_ratio,
+            "total_target_tokens": results.total_target_tokens,
+            "speedup": results.overall_speedup,
+            "hit_ratio": results.overall_hit_ratio,
             "context_found_rate": results.context_found_rate,
             "match_rate": results.match_rate,
             "avg_context_length": results.avg_context_length,
