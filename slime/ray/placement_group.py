@@ -1,4 +1,5 @@
 import logging
+import os
 import socket
 
 import ray
@@ -172,10 +173,23 @@ def create_training_models(args, pgs, rollout_manager):
 
 
 def create_rollout_manager(args, pg):
-    rollout_manager = RolloutManager.options(
-        num_cpus=1,
-        num_gpus=0,
-    ).remote(args, pg)
+    pin_rollout_manager = os.environ.get("SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER", "0") == "1"
+    rollout_manager_options = {
+        "num_cpus": 1,
+        "num_gpus": 0,
+    }
+    if pin_rollout_manager:
+        driver_ip = ray.util.get_node_ip_address()
+        node_resource_key = f"node:{driver_ip}"
+        rollout_manager_options["resources"] = {node_resource_key: 0.001}
+        logger.info(
+            f"Pinning RolloutManager to driver node {driver_ip} "
+            f"using Ray resource constraint {node_resource_key}"
+        )
+    else:
+        logger.info("RolloutManager pinning disabled (SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER != 1)")
+
+    rollout_manager = RolloutManager.options(**rollout_manager_options).remote(args, pg)
 
     # calculate num_rollout from num_epoch
     num_rollout_per_epoch = None

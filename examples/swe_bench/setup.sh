@@ -29,6 +29,13 @@ else
     echo "[swe-setup] docker CLI already available."
 fi
 
+echo "[swe-setup] Verifying docker daemon connectivity..."
+if ! docker info >/dev/null 2>&1; then
+    echo "[swe-setup] ERROR: docker CLI cannot reach local daemon via /var/run/docker.sock."
+    exit 1
+fi
+echo "[swe-setup] Docker daemon connectivity check passed."
+
 if [[ ! -d /root/swe_livup ]]; then
     echo "[swe-setup] ERROR: /root/swe_livup not found."
     echo "[swe-setup] Mount swe_livup with: -v /home/shramana/evaluation/swe_livup:/root/swe_livup"
