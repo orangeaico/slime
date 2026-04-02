@@ -5,10 +5,21 @@ Speculative Decoding Hit Ratio Analysis
 This script analyzes the potential hit ratio for n-gram based speculative decoding.
 Given multiple rollouts per prompt, it can operate in two modes:
 1. Single draft mode (default): Uses the first rollout (rollout_id=0) as a draft for all others
+   - If no rollout_id=0 exists, uses only self-lookup for all rollouts
 2. All rollouts mode (--use-all-rollouts): For each rollout, uses all other rollouts as drafts
+   - If only one rollout exists, uses only self-lookup for that rollout
+
+Features:
+- Supports multi-turn conversations (system, user, assistant messages)
+- Uses chat templates for proper tokenization of conversations
+- Performs self-lookup: also searches within the current rollout up to the current position
+  (ensuring at least k tokens are available after any matched prefix)
+- For each assistant turn, uses the full conversation context from other rollouts as drafts
 
 The matching scheme:
 - Uses token-based n-gram matching with longest match strategy
+- Searches in both other rollouts (full content) and current rollout (up to current position)
+- Ensures at least k speculative tokens are available after any matched prefix
 - Optionally, when using --use-all-rollouts --use-two-prefix-algorithm, computes dynamic k from suffix:
   1. First, finds matches using longest match strategy (same as default)
   2. For each match found, tries to find a second prefix with longest common end portion (>= context_size)
@@ -25,6 +36,7 @@ Usage:
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --context-size 4 --k 5
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --use-all-rollouts
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --use-all-rollouts --use-two-prefix-algorithm
+    python speculative_decoding_analysis.py --input all_rollouts.jsonl --limit-current-to-previous-turn
 """
 
 import argparse
@@ -53,8 +65,7 @@ class Rollout:
     """Represents a single rollout for a prompt."""
     instance_id: int
     rollout_id: int
-    user_content: str
-    assistant_content: str
+    messages: list[dict[str, str]]  # Full conversation history with role and content
 
 
 @dataclass
@@ -177,6 +188,99 @@ def tokenize_text(tokenizer: AutoTokenizer, text: str) -> list[int]:
     return tokenizer.encode(text, add_special_tokens=False)
 
 
+@dataclass
+class AssistantTurn:
+    """Represents a single assistant turn in a conversation."""
+    turn_index: int  # Index of this assistant turn (0-based)
+    start_token_idx: int  # Start index of assistant tokens in full sequence
+    end_token_idx: int  # End index of assistant tokens in full sequence (exclusive)
+    tokens: list[int]  # Token IDs for this assistant turn only
+
+
+@dataclass
+class TokenizedRollout:
+    """Represents a tokenized rollout with full sequence and assistant turn boundaries."""
+    instance_id: int
+    rollout_id: int
+    full_tokens: list[int]  # All tokens including system, user, and all assistant turns
+    assistant_turns: list[AssistantTurn]  # Information about each assistant turn
+
+
+def tokenize_messages_with_turns(
+    tokenizer: AutoTokenizer,
+    messages: list[dict[str, str]],
+    instance_id: int,
+    rollout_id: int,
+) -> TokenizedRollout:
+    """
+    Tokenize messages using chat template and identify assistant turn boundaries.
+
+    This function processes messages incrementally, tokenizing the conversation
+    up to each assistant turn to identify which tokens belong to each assistant response.
+
+    Args:
+        tokenizer: HuggingFace tokenizer
+        messages: List of message dictionaries with 'role' and 'content'
+        instance_id: Instance ID for this rollout
+        rollout_id: Rollout ID
+
+    Returns:
+        TokenizedRollout with full token sequence and assistant turn information
+    """
+    assistant_turns = []
+    assistant_turn_index = 0
+
+    # Tokenize the full conversation
+    full_tokens = tokenizer.apply_chat_template(
+        messages,
+        tokenize=True,
+        add_generation_prompt=False
+    )
+
+    # Process messages incrementally to find assistant turn boundaries
+    current_pos = 0
+    for i, msg in enumerate(messages):
+        if msg["role"] == "assistant":
+            # Tokenize conversation up to (but not including) this assistant message
+            if i > 0:
+                prefix_messages = messages[:i]
+                prefix_tokens = tokenizer.apply_chat_template(
+                    prefix_messages,
+                    tokenize=True,
+                    add_generation_prompt=False
+                )
+                start_idx = len(prefix_tokens)
+            else:
+                start_idx = 0
+
+            # Tokenize conversation up to and including this assistant message
+            messages_with_assistant = messages[:i+1]
+            tokens_with_assistant = tokenizer.apply_chat_template(
+                messages_with_assistant,
+                tokenize=True,
+                add_generation_prompt=False
+            )
+            end_idx = len(tokens_with_assistant)
+
+            # Extract tokens for this assistant turn
+            assistant_tokens = tokens_with_assistant[start_idx:end_idx]
+
+            assistant_turns.append(AssistantTurn(
+                turn_index=assistant_turn_index,
+                start_token_idx=start_idx,
+                end_token_idx=end_idx,
+                tokens=assistant_tokens,
+            ))
+            assistant_turn_index += 1
+
+    return TokenizedRollout(
+        instance_id=instance_id,
+        rollout_id=rollout_id,
+        full_tokens=full_tokens,
+        assistant_turns=assistant_turns,
+    )
+
+
 # =============================================================================
 # Data Loading
 # =============================================================================
@@ -186,7 +290,7 @@ def load_rollouts(input_file: str) -> dict[int, InstanceRollouts]:
     Load rollouts from JSONL file and group by instance_id.
 
     Expected format per line:
-    {"instance_id": int, "rollout_id": int, "messages": [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]}
+    {"instance_id": int, "rollout_id": int, "messages": [{"role": "system/user/assistant", "content": ...}, ...]}
     """
     instances: dict[int, InstanceRollouts] = {}
 
@@ -198,20 +302,10 @@ def load_rollouts(input_file: str) -> dict[int, InstanceRollouts]:
                 rollout_id = data["rollout_id"]
                 messages = data["messages"]
 
-                # Extract user and assistant content
-                user_content = ""
-                assistant_content = ""
-                for msg in messages:
-                    if msg["role"] == "user":
-                        user_content = msg["content"]
-                    elif msg["role"] == "assistant":
-                        assistant_content = msg["content"]
-
                 rollout = Rollout(
                     instance_id=instance_id,
                     rollout_id=rollout_id,
-                    user_content=user_content,
-                    assistant_content=assistant_content,
+                    messages=messages,
                 )
 
                 if instance_id not in instances:
@@ -260,6 +354,8 @@ def find_longest_match(
     draft_tokens: list[int],
     draft_index: dict[tuple[int, ...], list[int]],
     min_context: int,
+    max_draft_length: int | None = None,
+    min_tokens_after: int = 0,
 ) -> tuple[int, int, int] | None:
     """
     Find the longest matching context in the draft for a given position.
@@ -273,6 +369,8 @@ def find_longest_match(
         draft_tokens: Draft token sequence
         draft_index: Pre-built n-gram index for minimum context size
         min_context: Minimum context size
+        max_draft_length: If specified, only consider draft tokens up to this position (exclusive)
+        min_tokens_after: Minimum number of tokens required after the matched context
 
     Returns:
         Tuple of (draft_position, context_length, num_candidates) for longest match, or None if no match
@@ -307,10 +405,27 @@ def find_longest_match(
             else:
                 break
 
+        # Adjust draft_pos to point to start of the extended context
+        final_draft_pos = draft_pos - (ctx_len - min_context)
+
+        # Check if the match end position is within the allowed draft length
+        match_end_pos = final_draft_pos + ctx_len
+        if max_draft_length is not None and match_end_pos > max_draft_length:
+            continue
+
+        # Check if enough tokens available after the match for speculation
+        # AND that those tokens are also within the allowed draft length
+        if min_tokens_after > 0:
+            required_length = match_end_pos + min_tokens_after
+            if required_length > len(draft_tokens):
+                continue
+            # For current rollout, ensure speculation tokens are also within bounds
+            if max_draft_length is not None and required_length > max_draft_length:
+                continue
+
         if ctx_len > best_context_len:
             best_context_len = ctx_len
-            # Adjust draft_pos to point to start of the extended context
-            best_draft_pos = draft_pos - (ctx_len - min_context)
+            best_draft_pos = final_draft_pos
 
     if best_draft_pos is not None:
         return (best_draft_pos, best_context_len, num_candidates)
@@ -374,6 +489,8 @@ def find_longest_match_multi_draft(
     all_draft_tokens: list[list[int]],
     all_draft_indices: list[dict[tuple[int, ...], list[int]]],
     min_context: int,
+    max_draft_lengths: list[int | None] | None = None,
+    min_tokens_after: int = 0,
 ) -> tuple[int, int, int, int] | None:
     """
     Find the longest matching context across multiple draft sequences.
@@ -384,6 +501,8 @@ def find_longest_match_multi_draft(
         all_draft_tokens: List of draft token sequences
         all_draft_indices: List of pre-built n-gram indices (one per draft)
         min_context: Minimum context size
+        max_draft_lengths: Optional list of max lengths (one per draft, or None for no limit)
+        min_tokens_after: Minimum number of tokens required after the matched context
 
     Returns:
         Tuple of (draft_idx, draft_position, context_length, num_candidates) for longest match, or None if no match
@@ -394,7 +513,15 @@ def find_longest_match_multi_draft(
     total_candidates = 0
 
     for draft_idx, (draft_tokens, draft_index) in enumerate(zip(all_draft_tokens, all_draft_indices)):
-        match = find_longest_match(target_tokens, pos, draft_tokens, draft_index, min_context)
+        max_length = None
+        if max_draft_lengths is not None and draft_idx < len(max_draft_lengths):
+            max_length = max_draft_lengths[draft_idx]
+
+        match = find_longest_match(
+            target_tokens, pos, draft_tokens, draft_index, min_context,
+            max_draft_length=max_length,
+            min_tokens_after=min_tokens_after,
+        )
 
         if match is not None:
             draft_pos, ctx_len, num_candidates = match
@@ -628,18 +755,23 @@ def calculate_hit_ratio_multi_draft(
     context_size: int = 3,
     per_token_verification_overhead: float = 0.0,
     use_two_prefix_algorithm: bool = False,
+    current_rollout_tokens: list[int] | None = None,
+    target_start_offset: int = 0,
+    max_current_rollout_length: int | None = None,
 ) -> HitRatioResult:
     """
     Calculate hit ratio for speculative decoding using multiple draft sequences.
 
     For each position in the target (after context_size tokens), we:
     1. Find matches using longest match strategy across all drafts
-    2. If use_two_prefix_algorithm is True, compute dynamic k based on suffix analysis
+    2. If current_rollout_tokens is provided, also search in the current rollout
+       up to the specified limit (ensuring k tokens available after match)
+    3. If use_two_prefix_algorithm is True, compute dynamic k based on suffix analysis
        - dynamic k = max(k, suffix_length), so always at least k
-    3. Otherwise, use original k
-    4. Speculate the next dynamic_k tokens from the best draft
-    5. Count how many of these match the actual target tokens
-    6. Skip forward by the number of accepted tokens (or 1 if none accepted)
+    4. Otherwise, use original k
+    5. Speculate the next dynamic_k tokens from the best draft
+    6. Count how many of these match the actual target tokens
+    7. Skip forward by the number of accepted tokens (or 1 if none accepted)
 
     Args:
         all_draft_tokens: List of token ID sequences from draft responses
@@ -648,12 +780,21 @@ def calculate_hit_ratio_multi_draft(
         context_size: Minimum context window size for n-gram matching
         per_token_verification_overhead: Cost per token verified (default: 0.0)
         use_two_prefix_algorithm: If True, compute dynamic k from suffix analysis (default: False)
+        current_rollout_tokens: Optional full token sequence from current rollout (for self-lookup)
+        target_start_offset: Offset where target_tokens start in current_rollout_tokens
+        max_current_rollout_length: If provided, fixed max length for current rollout lookup;
+                                    otherwise computed dynamically as target_start_offset + pos
 
     Returns:
         HitRatioResult with hit statistics
     """
     # Build n-gram indices for all drafts
     all_draft_indices = [build_ngram_index(draft_tokens, context_size) for draft_tokens in all_draft_tokens]
+
+    # Build index for current rollout if provided
+    current_rollout_index = None
+    if current_rollout_tokens is not None:
+        current_rollout_index = build_ngram_index(current_rollout_tokens, context_size)
 
     # Total tokens to generate (excluding initial context)
     total_target_tokens = max(0, len(target_tokens) - context_size)
@@ -674,6 +815,26 @@ def calculate_hit_ratio_multi_draft(
     while pos < len(target_tokens):
         total_positions += 1
 
+        # Prepare draft lists (include current rollout if provided)
+        drafts_to_search = list(all_draft_tokens)
+        draft_indices_to_search = list(all_draft_indices)
+        max_draft_lengths = [None] * len(all_draft_tokens)
+
+        if current_rollout_tokens is not None and current_rollout_index is not None:
+            # Add current rollout with restriction
+            # Two modes:
+            # 1. If max_current_rollout_length is provided (limit to previous turn):
+            #    Use fixed length (typically start of current assistant turn)
+            # 2. Otherwise (default): dynamically use target_start_offset + pos
+            #    (all content up to current position)
+            if max_current_rollout_length is not None:
+                max_current_length = max_current_rollout_length
+            else:
+                max_current_length = target_start_offset + pos
+            drafts_to_search.append(current_rollout_tokens)
+            draft_indices_to_search.append(current_rollout_index)
+            max_draft_lengths.append(max_current_length)
+
         # Always use longest match algorithm to find matches
         # Need to collect all matches if use_two_prefix_algorithm is True
         if use_two_prefix_algorithm:
@@ -682,15 +843,20 @@ def calculate_hit_ratio_multi_draft(
             best_draft_idx = None
             best_draft_pos = None
             best_context_len = 0
-            total_candidates = 0
+            num_candidates_total = 0
 
-            for draft_idx, (draft_tokens, draft_index) in enumerate(zip(all_draft_tokens, all_draft_indices)):
-                match = find_longest_match(target_tokens, pos, draft_tokens, draft_index, context_size)
+            for draft_idx, (draft_tokens, draft_index) in enumerate(zip(drafts_to_search, draft_indices_to_search)):
+                max_length = max_draft_lengths[draft_idx] if draft_idx < len(max_draft_lengths) else None
+                match = find_longest_match(
+                    target_tokens, pos, draft_tokens, draft_index, context_size,
+                    max_draft_length=max_length,
+                    min_tokens_after=k,
+                )
 
                 if match is not None:
                     draft_pos, ctx_len, num_candidates = match
                     all_matches.append((draft_idx, draft_pos, ctx_len, num_candidates))
-                    total_candidates += num_candidates
+                    num_candidates_total += num_candidates
 
                     if ctx_len > best_context_len:
                         best_context_len = ctx_len
@@ -706,18 +872,20 @@ def calculate_hit_ratio_multi_draft(
             # Compute dynamic k based on suffix analysis
             dynamic_k = compute_dynamic_k_from_suffix(
                 best_draft_idx, best_draft_pos, best_context_len,
-                all_draft_tokens, all_matches, context_size, k
+                drafts_to_search, all_matches, context_size, k
             )
 
             draft_idx = best_draft_idx
             draft_pos = best_draft_pos
             ctx_len = best_context_len
-            num_candidates = total_candidates
+            num_candidates = num_candidates_total
         else:
             # Use find_longest_match_multi_draft (more efficient when not computing suffix)
             match = find_longest_match_multi_draft(
-                target_tokens, pos, all_draft_tokens, all_draft_indices,
+                target_tokens, pos, drafts_to_search, draft_indices_to_search,
                 min_context=context_size,
+                max_draft_lengths=max_draft_lengths,
+                min_tokens_after=k,
             )
 
             if match is None:
@@ -733,8 +901,8 @@ def calculate_hit_ratio_multi_draft(
 
         # Get speculated tokens from the best draft (tokens after the matched context)
         spec_start = draft_pos + ctx_len
-        spec_end = min(spec_start + dynamic_k, len(all_draft_tokens[draft_idx]))
-        speculated_tokens = all_draft_tokens[draft_idx][spec_start:spec_end]
+        spec_end = min(spec_start + dynamic_k, len(drafts_to_search[draft_idx]))
+        speculated_tokens = drafts_to_search[draft_idx][spec_start:spec_end]
 
         if not speculated_tokens:
             # Context was found but no tokens to speculate, generate 1 token normally (cost = 1)
@@ -803,6 +971,7 @@ class AnalysisConfig:
     use_all_rollouts: bool = False  # If True, use all other rollouts as drafts; if False, use only rollout_id=0
     per_token_verification_overhead: float = 0.0  # Cost per token verified
     use_two_prefix_algorithm: bool = False  # If True, compute dynamic k from suffix analysis (only applies when use_all_rollouts=True)
+    limit_current_to_previous_turn: bool = False  # If True, limit current rollout lookup to end of previous turn; if False, use up to current position
 
 
 @dataclass
@@ -882,7 +1051,11 @@ def analyze_instance(
     config: AnalysisConfig,
 ) -> list[HitRatioResult]:
     """
-    Analyze a single instance's rollouts.
+    Analyze a single instance's rollouts with multi-turn support.
+
+    For each assistant turn in each rollout:
+    - Uses the full tokenized content (all messages) from other rollouts as drafts
+    - Compares only the tokens from the current assistant turn
 
     Args:
         instance: Collection of rollouts for this instance
@@ -890,66 +1063,116 @@ def analyze_instance(
         config: Analysis configuration
 
     Returns:
-        List of HitRatioResults (one per verification rollout)
+        List of HitRatioResults (one per assistant turn per rollout)
     """
+    # Tokenize all rollouts with turn information
+    tokenized_rollouts = []
+    for rollout in instance.rollouts:
+        tokenized = tokenize_messages_with_turns(
+            tokenizer=tokenizer,
+            messages=rollout.messages,
+            instance_id=rollout.instance_id,
+            rollout_id=rollout.rollout_id,
+        )
+        tokenized_rollouts.append(tokenized)
+
+    results: list[HitRatioResult] = []
+
     if config.use_all_rollouts:
         # Mode: Use all other rollouts as drafts for each target rollout
-        if len(instance.rollouts) < 2:
-            logger.warning(f"Instance {instance.instance_id} has fewer than 2 rollouts")
+        if len(tokenized_rollouts) < 1:
+            logger.warning(f"Instance {instance.instance_id} has no rollouts")
             return []
 
-        results: list[HitRatioResult] = []
+        if len(tokenized_rollouts) == 1:
+            logger.info(f"Instance {instance.instance_id} has only 1 rollout, using only self-lookup")
 
         # For each rollout, use all other rollouts as drafts
-        for target_rollout in instance.rollouts:
-            # Get all other rollouts as drafts
-            draft_rollouts = [r for r in instance.rollouts if r.rollout_id != target_rollout.rollout_id]
+        for target_rollout in tokenized_rollouts:
+            # Get all other rollouts as drafts (use their full tokens)
+            # If there's only one rollout, this will be empty (self-lookup only)
+            draft_rollouts = [r for r in tokenized_rollouts if r.rollout_id != target_rollout.rollout_id]
+            all_draft_tokens = [r.full_tokens for r in draft_rollouts]
 
-            # Tokenize all drafts
-            all_draft_tokens = [tokenize_text(tokenizer, r.assistant_content) for r in draft_rollouts]
+            # Analyze each assistant turn in the target rollout
+            for assistant_turn in target_rollout.assistant_turns:
+                # For this assistant turn, we need to compare its tokens against drafts
+                # The target tokens are just this assistant turn's tokens
+                target_tokens = assistant_turn.tokens
 
-            # Tokenize target
-            target_tokens = tokenize_text(tokenizer, target_rollout.assistant_content)
+                if not target_tokens:
+                    continue
 
-            result = calculate_hit_ratio_multi_draft(
-                all_draft_tokens=all_draft_tokens,
-                target_tokens=target_tokens,
-                k=config.k,
-                context_size=config.context_size,
-                per_token_verification_overhead=config.per_token_verification_overhead,
-                use_two_prefix_algorithm=config.use_two_prefix_algorithm,
-            )
-            results.append(result)
+                # Determine max length for current rollout lookup
+                max_current_length = None
+                if config.limit_current_to_previous_turn:
+                    # Limit to end of previous turn (start of current turn)
+                    max_current_length = assistant_turn.start_token_idx
+
+                result = calculate_hit_ratio_multi_draft(
+                    all_draft_tokens=all_draft_tokens,
+                    target_tokens=target_tokens,
+                    k=config.k,
+                    context_size=config.context_size,
+                    per_token_verification_overhead=config.per_token_verification_overhead,
+                    use_two_prefix_algorithm=config.use_two_prefix_algorithm,
+                    current_rollout_tokens=target_rollout.full_tokens,
+                    target_start_offset=assistant_turn.start_token_idx,
+                    max_current_rollout_length=max_current_length,
+                )
+                results.append(result)
 
         return results
     else:
-        # Mode: Use only rollout_id=0 as draft for all other rollouts
-        draft = instance.get_draft()
-        if draft is None:
-            logger.warning(f"Instance {instance.instance_id} has no draft rollout")
-            return []
+        # Mode: Use only rollout_id=0 as draft for all other rollouts (if available)
+        draft_rollout = None
+        for r in tokenized_rollouts:
+            if r.rollout_id == 0:
+                draft_rollout = r
+                break
 
-        verification_rollouts = instance.get_verification_rollouts()
-        if not verification_rollouts:
-            logger.warning(f"Instance {instance.instance_id} has no verification rollouts")
-            return []
+        # Determine which rollouts to verify
+        if draft_rollout is None:
+            # No draft rollout, analyze all rollouts using only self-lookup
+            logger.info(f"Instance {instance.instance_id} has no draft rollout, using only self-lookup")
+            verification_rollouts = tokenized_rollouts
+            all_draft_tokens = []
+        else:
+            # Draft rollout exists, verify all other rollouts
+            verification_rollouts = [r for r in tokenized_rollouts if r.rollout_id != 0]
+            if not verification_rollouts:
+                logger.warning(f"Instance {instance.instance_id} has no verification rollouts")
+                return []
+            all_draft_tokens = [draft_rollout.full_tokens]
 
-        # Tokenize draft
-        draft_tokens = tokenize_text(tokenizer, draft.assistant_content)
+        # Analyze each assistant turn in each verification rollout
+        for target_rollout in verification_rollouts:
+            for assistant_turn in target_rollout.assistant_turns:
+                # For this assistant turn, compare its tokens against the draft
+                target_tokens = assistant_turn.tokens
 
-        results: list[HitRatioResult] = []
+                if not target_tokens:
+                    continue
 
-        for rollout in verification_rollouts:
-            target_tokens = tokenize_text(tokenizer, rollout.assistant_content)
+                # Determine max length for current rollout lookup
+                max_current_length = None
+                if config.limit_current_to_previous_turn:
+                    # Limit to end of previous turn (start of current turn)
+                    max_current_length = assistant_turn.start_token_idx
 
-            result = calculate_hit_ratio(
-                draft_tokens=draft_tokens,
-                target_tokens=target_tokens,
-                k=config.k,
-                context_size=config.context_size,
-                per_token_verification_overhead=config.per_token_verification_overhead,
-            )
-            results.append(result)
+                # Use multi_draft function with draft(s) + current rollout
+                result = calculate_hit_ratio_multi_draft(
+                    all_draft_tokens=all_draft_tokens,
+                    target_tokens=target_tokens,
+                    k=config.k,
+                    context_size=config.context_size,
+                    per_token_verification_overhead=config.per_token_verification_overhead,
+                    use_two_prefix_algorithm=False,  # Not applicable in single draft mode
+                    current_rollout_tokens=target_rollout.full_tokens,
+                    target_start_offset=assistant_turn.start_token_idx,
+                    max_current_rollout_length=max_current_length,
+                )
+                results.append(result)
 
         return results
 
@@ -1036,6 +1259,8 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
     print(f"Matching strategy: longest match")
     rollout_mode = "all other rollouts" if config.use_all_rollouts else "rollout_id=0 only"
     print(f"Draft rollout mode: {rollout_mode}")
+    current_lookup_mode = "up to previous turn" if config.limit_current_to_previous_turn else "up to current position"
+    print(f"Current rollout self-lookup: {current_lookup_mode}")
     print("-" * 80)
 
     print(f"\nOverall Metrics:")
@@ -1079,10 +1304,18 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
     print("Matching strategy:")
     print("  - Token-based n-gram matching (longest match)")
     print("    Uses n-gram token matching to find the longest matching context")
+    print("  - Self-lookup enabled: Also searches within current rollout")
+    if config.limit_current_to_previous_turn:
+        print("    Limit: Up to end of previous turn (start of current assistant turn)")
+    else:
+        print("    Limit: Up to current position (includes partial current turn generation)")
+    print("    (ensuring at least k tokens available after any matched prefix)")
     print("")
     print("Draft rollout mode:")
     if config.use_all_rollouts:
         print("  - All other rollouts: For each rollout, all other rollouts are used as drafts")
+        print("    If only one rollout exists, uses only self-lookup for that rollout")
+        print("  - Additionally includes current rollout (self-lookup) with position restrictions")
         if config.use_two_prefix_algorithm:
             print("    Dynamic k computation: ENABLED")
             print("      1. Finds matches using longest match strategy")
@@ -1093,7 +1326,9 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
         else:
             print("    Dynamic k computation: DISABLED (using fixed k)")
     else:
-        print("  - Single draft (rollout_id=0): Only the first rollout is used as draft for all others")
+        print("  - Single draft (rollout_id=0): The first rollout is used as draft for all others")
+        print("    If no rollout_id=0 exists, uses only self-lookup for all rollouts")
+        print("  - Additionally includes current rollout (self-lookup) with position restrictions")
     print("")
 
 
@@ -1111,6 +1346,7 @@ def save_results(
             "use_all_rollouts": config.use_all_rollouts,
             "per_token_verification_overhead": config.per_token_verification_overhead,
             "use_two_prefix_algorithm": config.use_two_prefix_algorithm,
+            "limit_current_to_previous_turn": config.limit_current_to_previous_turn,
         },
         "results": {
             "k_value": results.k_value,
@@ -1192,6 +1428,12 @@ def main():
         help="If set, compute dynamic k from suffix analysis (only applies when --use-all-rollouts is True) (default: False)",
     )
     parser.add_argument(
+        "--limit-current-to-previous-turn",
+        action="store_true",
+        default=False,
+        help="If set, limit current rollout self-lookup to content up to end of previous turn; otherwise uses content up to current position (default: False)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
@@ -1217,6 +1459,7 @@ def main():
         use_all_rollouts=args.use_all_rollouts,
         per_token_verification_overhead=args.per_token_verification_overhead,
         use_two_prefix_algorithm=args.use_two_prefix_algorithm,
+        limit_current_to_previous_turn=args.limit_current_to_previous_turn,
     )
 
     logger.info(f"Loading rollouts from {args.input}")
