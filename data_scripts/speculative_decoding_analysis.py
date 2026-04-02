@@ -3,12 +3,16 @@
 Speculative Decoding Hit Ratio Analysis
 
 This script analyzes the potential hit ratio for n-gram based speculative decoding.
-Given multiple rollouts per prompt, it uses the first rollout as a draft and measures
-how well the draft can predict tokens in subsequent rollouts.
+Given multiple rollouts per prompt, it can operate in two modes:
+1. Single draft mode (default): Uses the first rollout (rollout_id=0) as a draft for all others
+2. All rollouts mode (--use-all-rollouts): For each rollout, uses all other rollouts as drafts
 
-The n-gram matching scheme (similar to vLLM's approach):
-- For each position in the target response, look at the previous n tokens (context)
-- Search for this context in the draft response
+The matching scheme:
+- By default, uses token-based n-gram matching only
+- Optionally (--use-char-fallback), enables hybrid token/character matching:
+  - First tries token-based n-gram matching
+  - If no token match is found, falls back to character-based prefix matching
+  - Character matching uses a configurable threshold (default: 5 characters)
 - If found, use the next k tokens from the draft as speculation candidates
 - Count how many of these speculated tokens match the actual target tokens
 
@@ -18,6 +22,8 @@ Usage:
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --k 4
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --context-size 4 --k 5
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --use-first-match
+    python speculative_decoding_analysis.py --input all_rollouts.jsonl --use-all-rollouts
+    python speculative_decoding_analysis.py --input all_rollouts.jsonl --use-char-fallback --char-threshold 10
 """
 
 import argparse
@@ -80,6 +86,7 @@ class HitRatioResult:
     total_candidates: int  # Total number of candidate matches found
     total_target_tokens: int = 0  # Total tokens to generate (target length - context_size)
     hit_lengths: dict[int, int] = field(default_factory=dict)  # Distribution of hit lengths: length -> count
+    total_verification_cost: float = 0.0  # Total cost accounting for per-token verification overhead
 
     @property
     def hit_ratio(self) -> float:
@@ -121,18 +128,18 @@ class HitRatioResult:
         """
         Speedup compared to non-speculative generation.
 
-        Speedup = (total tokens to generate) / (total generation steps needed)
+        Speedup = (total tokens to generate) / (total generation cost with verification overhead)
 
         Logic:
         - Without speculation: Need 1 generation step per token = total_target_tokens steps
-        - With speculation: Need total_positions steps (some steps generate multiple tokens)
+        - With speculation: Need total_verification_cost steps accounting for verification overhead
         - Speedup shows how many times faster speculative decoding is
 
         Example: If speedup = 2.0, speculative decoding is 2x faster
         """
-        if self.total_positions == 0:
+        if self.total_verification_cost == 0:
             return 0.0
-        return self.total_target_tokens / self.total_positions
+        return self.total_target_tokens / self.total_verification_cost
 
 
 # =============================================================================
@@ -225,6 +232,133 @@ def load_rollouts(input_file: str) -> dict[int, InstanceRollouts]:
 # =============================================================================
 # N-gram Matching for Speculative Decoding
 # =============================================================================
+
+def decode_tokens_to_text(tokenizer: AutoTokenizer, tokens: list[int]) -> str:
+    """Decode tokens to text string."""
+    return tokenizer.decode(tokens, skip_special_tokens=True)
+
+
+def find_longest_char_match(
+    target_text: str,
+    target_pos_tokens: int,
+    target_tokens: list[int],
+    draft_text: str,
+    draft_tokens: list[int],
+    tokenizer: AutoTokenizer,
+    min_chars: int,
+) -> tuple[int, int] | None:
+    """
+    Find the longest character-based match in the draft for a given position.
+
+    Args:
+        target_text: Target text string
+        target_pos_tokens: Current position in target tokens
+        target_tokens: Target token sequence
+        draft_text: Draft text string
+        draft_tokens: Draft token sequence
+        tokenizer: Tokenizer for decoding
+        min_chars: Minimum character length to consider a match
+
+    Returns:
+        Tuple of (draft_token_position, match_length_in_chars) or None if no match
+    """
+    # Decode target up to current position to get character offset
+    target_prefix_text = decode_tokens_to_text(tokenizer, target_tokens[:target_pos_tokens])
+    target_char_pos = len(target_prefix_text)
+
+    # Get a reasonable context window in characters (e.g., last 100 chars)
+    context_start = max(0, target_char_pos - 100)
+    context_text = target_text[context_start:target_char_pos]
+
+    if len(context_text) < min_chars:
+        return None
+
+    # Try to find longest matching substring in draft
+    best_draft_pos = None
+    best_match_len = 0
+
+    # Start with longer substrings and work down to min_chars
+    for length in range(len(context_text), min_chars - 1, -1):
+        search_str = context_text[-length:]
+        pos = draft_text.find(search_str)
+
+        if pos != -1:
+            # Found a match, now convert character position back to token position
+            # Find the token position in draft that corresponds to this character position
+            draft_prefix = draft_text[:pos + length]
+
+            # Binary search or sequential search to find token position
+            draft_token_pos = 0
+            for i in range(1, len(draft_tokens) + 1):
+                decoded = decode_tokens_to_text(tokenizer, draft_tokens[:i])
+                if len(decoded) >= len(draft_prefix):
+                    draft_token_pos = i
+                    break
+
+            best_draft_pos = draft_token_pos
+            best_match_len = length
+            break
+
+    if best_draft_pos is not None:
+        return (best_draft_pos, best_match_len)
+
+    return None
+
+
+def find_first_char_match(
+    target_text: str,
+    target_pos_tokens: int,
+    target_tokens: list[int],
+    draft_text: str,
+    draft_tokens: list[int],
+    tokenizer: AutoTokenizer,
+    min_chars: int,
+) -> tuple[int, int] | None:
+    """
+    Find the first character-based match in the draft for a given position.
+
+    Args:
+        target_text: Target text string
+        target_pos_tokens: Current position in target tokens
+        target_tokens: Target token sequence
+        draft_text: Draft text string
+        draft_tokens: Draft token sequence
+        tokenizer: Tokenizer for decoding
+        min_chars: Minimum character length to consider a match
+
+    Returns:
+        Tuple of (draft_token_position, match_length_in_chars) or None if no match
+    """
+    # Decode target up to current position to get character offset
+    target_prefix_text = decode_tokens_to_text(tokenizer, target_tokens[:target_pos_tokens])
+    target_char_pos = len(target_prefix_text)
+
+    # Get a reasonable context window in characters
+    context_start = max(0, target_char_pos - 100)
+    context_text = target_text[context_start:target_char_pos]
+
+    if len(context_text) < min_chars:
+        return None
+
+    # Try to find first match with at least min_chars
+    search_str = context_text[-min_chars:]
+    pos = draft_text.find(search_str)
+
+    if pos != -1:
+        # Found a match, convert character position to token position
+        draft_prefix = draft_text[:pos + min_chars]
+
+        draft_token_pos = 0
+        for i in range(1, len(draft_tokens) + 1):
+            decoded = decode_tokens_to_text(tokenizer, draft_tokens[:i])
+            if len(decoded) >= len(draft_prefix):
+                draft_token_pos = i
+                break
+
+        return (draft_token_pos, min_chars)
+
+    return None
+
 
 def build_ngram_index(tokens: list[int], n: int) -> dict[tuple[int, ...], list[int]]:
     """
@@ -348,21 +482,184 @@ def find_first_match(
     return (draft_pos, ctx_len, num_candidates)
 
 
+def find_longest_char_match_multi_draft(
+    target_text: str,
+    target_pos_tokens: int,
+    target_tokens: list[int],
+    all_draft_texts: list[str],
+    all_draft_tokens: list[list[int]],
+    tokenizer: AutoTokenizer,
+    min_chars: int,
+) -> tuple[int, int, int] | None:
+    """
+    Find the longest character-based match across multiple draft sequences.
+
+    Args:
+        target_text: Target text string
+        target_pos_tokens: Current position in target tokens
+        target_tokens: Target token sequence
+        all_draft_texts: List of draft text strings
+        all_draft_tokens: List of draft token sequences
+        tokenizer: Tokenizer for decoding
+        min_chars: Minimum character length to consider a match
+
+    Returns:
+        Tuple of (draft_idx, draft_token_position, match_length_in_chars) or None if no match
+    """
+    best_draft_idx = None
+    best_draft_pos = None
+    best_match_len = 0
+
+    for draft_idx, (draft_text, draft_tokens) in enumerate(zip(all_draft_texts, all_draft_tokens)):
+        char_match = find_longest_char_match(
+            target_text, target_pos_tokens, target_tokens,
+            draft_text, draft_tokens, tokenizer, min_chars,
+        )
+
+        if char_match is not None:
+            draft_pos, match_len = char_match
+            if match_len > best_match_len:
+                best_match_len = match_len
+                best_draft_pos = draft_pos
+                best_draft_idx = draft_idx
+
+    if best_draft_idx is not None:
+        return (best_draft_idx, best_draft_pos, best_match_len)
+
+    return None
+
+
+def find_first_char_match_multi_draft(
+    target_text: str,
+    target_pos_tokens: int,
+    target_tokens: list[int],
+    all_draft_texts: list[str],
+    all_draft_tokens: list[list[int]],
+    tokenizer: AutoTokenizer,
+    min_chars: int,
+) -> tuple[int, int, int] | None:
+    """
+    Find the first character-based match across multiple draft sequences.
+
+    Args:
+        target_text: Target text string
+        target_pos_tokens: Current position in target tokens
+        target_tokens: Target token sequence
+        all_draft_texts: List of draft text strings
+        all_draft_tokens: List of draft token sequences
+        tokenizer: Tokenizer for decoding
+        min_chars: Minimum character length to consider a match
+
+    Returns:
+        Tuple of (draft_idx, draft_token_position, match_length_in_chars) or None if no match
+    """
+    for draft_idx, (draft_text, draft_tokens) in enumerate(zip(all_draft_texts, all_draft_tokens)):
+        char_match = find_first_char_match(
+            target_text, target_pos_tokens, target_tokens,
+            draft_text, draft_tokens, tokenizer, min_chars,
+        )
+
+        if char_match is not None:
+            draft_pos, match_len = char_match
+            return (draft_idx, draft_pos, match_len)
+
+    return None
+
+
+def find_longest_match_multi_draft(
+    target_tokens: list[int],
+    pos: int,
+    all_draft_tokens: list[list[int]],
+    all_draft_indices: list[dict[tuple[int, ...], list[int]]],
+    min_context: int,
+) -> tuple[int, int, int, int] | None:
+    """
+    Find the longest matching context across multiple draft sequences.
+
+    Args:
+        target_tokens: Target token sequence
+        pos: Current position in target (where we want to speculate)
+        all_draft_tokens: List of draft token sequences
+        all_draft_indices: List of pre-built n-gram indices (one per draft)
+        min_context: Minimum context size
+
+    Returns:
+        Tuple of (draft_idx, draft_position, context_length, num_candidates) for longest match, or None if no match
+    """
+    best_draft_idx = None
+    best_draft_pos = None
+    best_context_len = 0
+    total_candidates = 0
+
+    for draft_idx, (draft_tokens, draft_index) in enumerate(zip(all_draft_tokens, all_draft_indices)):
+        match = find_longest_match(target_tokens, pos, draft_tokens, draft_index, min_context)
+
+        if match is not None:
+            draft_pos, ctx_len, num_candidates = match
+            total_candidates += num_candidates
+
+            if ctx_len > best_context_len:
+                best_context_len = ctx_len
+                best_draft_pos = draft_pos
+                best_draft_idx = draft_idx
+
+    if best_draft_idx is not None:
+        return (best_draft_idx, best_draft_pos, best_context_len, total_candidates)
+
+    return None
+
+
+def find_first_match_multi_draft(
+    target_tokens: list[int],
+    pos: int,
+    all_draft_tokens: list[list[int]],
+    all_draft_indices: list[dict[tuple[int, ...], list[int]]],
+    min_context: int,
+) -> tuple[int, int, int, int] | None:
+    """
+    Find the first matching context across multiple draft sequences.
+    Returns as soon as a match is found in any draft.
+
+    Args:
+        target_tokens: Target token sequence
+        pos: Current position in target (where we want to speculate)
+        all_draft_tokens: List of draft token sequences
+        all_draft_indices: List of pre-built n-gram indices (one per draft)
+        min_context: Minimum context size
+
+    Returns:
+        Tuple of (draft_idx, draft_position, context_length, num_candidates) for first match, or None if no match
+    """
+    for draft_idx, (draft_tokens, draft_index) in enumerate(zip(all_draft_tokens, all_draft_indices)):
+        match = find_first_match(target_tokens, pos, draft_tokens, draft_index, min_context)
+
+        if match is not None:
+            draft_pos, ctx_len, num_candidates = match
+            return (draft_idx, draft_pos, ctx_len, num_candidates)
+
+    return None
+
+
 def calculate_hit_ratio(
     draft_tokens: list[int],
     target_tokens: list[int],
     k: int,
+    tokenizer: AutoTokenizer,
     context_size: int = 3,
     use_longest_match: bool = True,
+    use_char_fallback: bool = False,
+    char_threshold: int = 5,
+    per_token_verification_overhead: float = 0.0,
 ) -> HitRatioResult:
     """
-    Calculate hit ratio for speculative decoding.
+    Calculate hit ratio for speculative decoding with optional hybrid token/character matching.
 
     For each position in the target (after context_size tokens), we:
-    1. Find a matching context (minimum context_size) in the draft
-    2. If found, speculate the next k tokens from the draft
-    3. Count how many of these match the actual target tokens
-    4. Skip forward by the number of accepted tokens (or 1 if none accepted)
+    1. Try token-based matching first (n-gram matching)
+    2. If no match found and use_char_fallback=True, fall back to character-based matching
+    3. If found, speculate the next k tokens from the draft
+    4. Count how many of these match the actual target tokens
+    5. Skip forward by the number of accepted tokens (or 1 if none accepted)
 
     This simulates the actual behavior of speculative decoding where accepted
     tokens are skipped, avoiding redundant speculation attempts.
@@ -371,14 +668,25 @@ def calculate_hit_ratio(
         draft_tokens: Token IDs from the draft response
         target_tokens: Token IDs from the target response
         k: Number of tokens to speculate
+        tokenizer: Tokenizer for character-based fallback
         context_size: Minimum context window size for n-gram matching
         use_longest_match: If True, find longest matching context; if False, use first match
+        use_char_fallback: If True, use character-based fallback when token matching fails
+        char_threshold: Minimum character length for character-based fallback
+        per_token_verification_overhead: Cost per token verified (default: 0.0)
 
     Returns:
         HitRatioResult with hit statistics
     """
     # Build n-gram index only for minimum context size
     draft_index = build_ngram_index(draft_tokens, context_size)
+
+    # Decode texts once for character-based fallback (only if enabled)
+    draft_text = None
+    target_text = None
+    if use_char_fallback:
+        draft_text = decode_tokens_to_text(tokenizer, draft_tokens)
+        target_text = decode_tokens_to_text(tokenizer, target_tokens)
 
     # Total tokens to generate (excluding initial context)
     total_target_tokens = max(0, len(target_tokens) - context_size)
@@ -390,10 +698,12 @@ def calculate_hit_ratio(
     total_speculated = 0
     total_context_length = 0
     total_candidates = 0
+    total_verification_cost = 0.0
     hit_lengths: dict[int, int] = defaultdict(int)
 
     # Select matching function based on configuration
-    match_fn = find_longest_match if use_longest_match else find_first_match
+    token_match_fn = find_longest_match if use_longest_match else find_first_match
+    char_match_fn = find_longest_char_match if use_longest_match else find_first_char_match
 
     # Iterate through target positions where we can attempt speculation
     # Skip positions based on accepted speculative tokens
@@ -401,18 +711,37 @@ def calculate_hit_ratio(
     while pos < len(target_tokens):
         total_positions += 1
 
-        # Find matching context
-        match = match_fn(
+        # Try token-based matching first
+        match = token_match_fn(
             target_tokens, pos, draft_tokens, draft_index,
             min_context=context_size,
         )
 
-        if match is None:
-            # No match found, move forward by 1
+        draft_pos = None
+        ctx_len = 0
+        num_candidates = 0
+
+        if match is not None:
+            draft_pos, ctx_len, num_candidates = match
+        elif use_char_fallback:
+            # Fall back to character-based matching (only if enabled)
+            char_match = char_match_fn(
+                target_text, pos, target_tokens,
+                draft_text, draft_tokens,
+                tokenizer, char_threshold,
+            )
+            if char_match is not None:
+                draft_pos, char_match_len = char_match
+                # Use 1 as context length for character matches (approximate)
+                ctx_len = 1
+                num_candidates = 1
+
+        if draft_pos is None:
+            # No match found, generate 1 token normally (cost = 1)
+            total_verification_cost += 1.0
             pos += 1
             continue
 
-        draft_pos, ctx_len, num_candidates = match
         context_found_positions += 1
 
         # Get speculated tokens from draft (tokens after the matched context)
@@ -421,7 +750,8 @@ def calculate_hit_ratio(
         speculated_tokens = draft_tokens[spec_start:spec_end]
 
         if not speculated_tokens:
-            # Context was found but no tokens to speculate, move forward by 1
+            # Context was found but no tokens to speculate, generate 1 token normally (cost = 1)
+            total_verification_cost += 1.0
             pos += 1
             continue
 
@@ -446,6 +776,12 @@ def calculate_hit_ratio(
         total_hits += hits
         hit_lengths[hits] += 1
 
+        # Calculate verification cost for this position
+        # Cost = 1 + per_token_verification_overhead * (k - 1)
+        # This assumes we always verify k tokens at each matching position
+        verification_cost = 1.0 + (k - 1) * per_token_verification_overhead
+        total_verification_cost += verification_cost
+
         # Move forward based on accepted tokens
         if hits > 0:
             # Skip positions covered by accepted speculative tokens
@@ -464,6 +800,169 @@ def calculate_hit_ratio(
         total_candidates=total_candidates,
         total_target_tokens=total_target_tokens,
         hit_lengths=dict(hit_lengths),
+        total_verification_cost=total_verification_cost,
+    )
+
+
+def calculate_hit_ratio_multi_draft(
+    all_draft_tokens: list[list[int]],
+    target_tokens: list[int],
+    k: int,
+    tokenizer: AutoTokenizer,
+    context_size: int = 3,
+    use_longest_match: bool = True,
+    use_char_fallback: bool = False,
+    char_threshold: int = 5,
+    per_token_verification_overhead: float = 0.0,
+) -> HitRatioResult:
+    """
+    Calculate hit ratio for speculative decoding using multiple draft sequences with optional hybrid matching.
+
+    For each position in the target (after context_size tokens), we:
+    1. Try token-based matching first (n-gram matching across all drafts)
+    2. If no match found and use_char_fallback=True, fall back to character-based matching
+    3. If found, speculate the next k tokens from the best draft
+    4. Count how many of these match the actual target tokens
+    5. Skip forward by the number of accepted tokens (or 1 if none accepted)
+
+    Args:
+        all_draft_tokens: List of token ID sequences from draft responses
+        target_tokens: Token IDs from the target response
+        k: Number of tokens to speculate
+        tokenizer: Tokenizer for character-based fallback
+        context_size: Minimum context window size for n-gram matching
+        use_longest_match: If True, find longest matching context; if False, use first match
+        use_char_fallback: If True, use character-based fallback when token matching fails
+        char_threshold: Minimum character length for character-based fallback
+        per_token_verification_overhead: Cost per token verified (default: 0.0)
+
+    Returns:
+        HitRatioResult with hit statistics
+    """
+    # Build n-gram indices for all drafts
+    all_draft_indices = [build_ngram_index(draft_tokens, context_size) for draft_tokens in all_draft_tokens]
+
+    # Decode texts once for character-based fallback (only if enabled)
+    all_draft_texts = None
+    target_text = None
+    if use_char_fallback:
+        all_draft_texts = [decode_tokens_to_text(tokenizer, draft_tokens) for draft_tokens in all_draft_tokens]
+        target_text = decode_tokens_to_text(tokenizer, target_tokens)
+
+    # Total tokens to generate (excluding initial context)
+    total_target_tokens = max(0, len(target_tokens) - context_size)
+
+    total_positions = 0
+    context_found_positions = 0
+    matched_positions = 0
+    total_hits = 0
+    total_speculated = 0
+    total_context_length = 0
+    total_candidates = 0
+    total_verification_cost = 0.0
+    hit_lengths: dict[int, int] = defaultdict(int)
+
+    # Select matching function based on configuration
+    token_match_fn = find_longest_match_multi_draft if use_longest_match else find_first_match_multi_draft
+    char_match_fn = find_longest_char_match_multi_draft if use_longest_match else find_first_char_match_multi_draft
+
+    # Iterate through target positions where we can attempt speculation
+    # Skip positions based on accepted speculative tokens
+    pos = context_size
+    while pos < len(target_tokens):
+        total_positions += 1
+
+        # Try token-based matching first
+        match = token_match_fn(
+            target_tokens, pos, all_draft_tokens, all_draft_indices,
+            min_context=context_size,
+        )
+
+        draft_idx = None
+        draft_pos = None
+        ctx_len = 0
+        num_candidates = 0
+
+        if match is not None:
+            draft_idx, draft_pos, ctx_len, num_candidates = match
+        elif use_char_fallback:
+            # Fall back to character-based matching (only if enabled)
+            char_match = char_match_fn(
+                target_text, pos, target_tokens,
+                all_draft_texts, all_draft_tokens,
+                tokenizer, char_threshold,
+            )
+            if char_match is not None:
+                draft_idx, draft_pos, char_match_len = char_match
+                # Use 1 as context length for character matches (approximate)
+                ctx_len = 1
+                num_candidates = 1
+
+        if draft_idx is None or draft_pos is None:
+            # No match found, generate 1 token normally (cost = 1)
+            total_verification_cost += 1.0
+            pos += 1
+            continue
+
+        context_found_positions += 1
+
+        # Get speculated tokens from the best draft (tokens after the matched context)
+        spec_start = draft_pos + ctx_len
+        spec_end = min(spec_start + k, len(all_draft_tokens[draft_idx]))
+        speculated_tokens = all_draft_tokens[draft_idx][spec_start:spec_end]
+
+        if not speculated_tokens:
+            # Context was found but no tokens to speculate, generate 1 token normally (cost = 1)
+            total_verification_cost += 1.0
+            pos += 1
+            continue
+
+        # Context was found and we have tokens to speculate
+        matched_positions += 1
+        total_context_length += ctx_len
+        total_candidates += num_candidates
+
+        # Get actual tokens from target
+        actual_end = min(pos + len(speculated_tokens), len(target_tokens))
+        actual_tokens = target_tokens[pos:actual_end]
+
+        # Count matches (consecutive from start)
+        hits = 0
+        for i, (spec, actual) in enumerate(zip(speculated_tokens, actual_tokens)):
+            if spec == actual:
+                hits += 1
+            else:
+                break  # Stop counting at first mismatch
+
+        total_speculated += len(speculated_tokens)
+        total_hits += hits
+        hit_lengths[hits] += 1
+
+        # Calculate verification cost for this position
+        # Cost = 1 + per_token_verification_overhead * (k - 1)
+        # This assumes we always verify k tokens at each matching position
+        verification_cost = 1.0 + (k - 1) * per_token_verification_overhead
+        total_verification_cost += verification_cost
+
+        # Move forward based on accepted tokens
+        if hits > 0:
+            # Skip positions covered by accepted speculative tokens
+            pos += hits
+        else:
+            # No tokens accepted, move by 1
+            pos += 1
+
+    return HitRatioResult(
+        total_positions=total_positions,
+        context_found_positions=context_found_positions,
+        matched_positions=matched_positions,
+        total_hits=total_hits,
+        total_speculated=total_speculated,
+        total_context_length=total_context_length,
+        total_candidates=total_candidates,
+        total_target_tokens=total_target_tokens,
+        hit_lengths=dict(hit_lengths),
+        total_verification_cost=total_verification_cost,
     )
 
 
@@ -478,6 +977,10 @@ class AnalysisConfig:
     context_size: int = 3
     model_path: str = ""
     use_longest_match: bool = True  # If True, find longest matching context; if False, use first match
+    use_all_rollouts: bool = False  # If True, use all other rollouts as drafts; if False, use only rollout_id=0
+    use_char_fallback: bool = False  # If True, use character-based fallback when token matching fails
+    char_threshold: int = 5  # Minimum character length for character-based fallback matching
+    per_token_verification_overhead: float = 0.0  # Cost per token verified
 
 
 @dataclass
@@ -494,6 +997,7 @@ class AggregatedResults:
     total_context_length: int
     total_candidates: int = 0
     total_target_tokens: int = 0
+    total_verification_cost: float = 0.0
     hit_lengths: dict[int, int] = field(default_factory=dict)  # Distribution of hit lengths
 
     @property
@@ -536,18 +1040,18 @@ class AggregatedResults:
         """
         Overall speedup compared to non-speculative generation.
 
-        Speedup = (total tokens to generate) / (total generation steps needed)
+        Speedup = (total tokens to generate) / (total generation cost with verification overhead)
 
         Logic:
         - Without speculation: Need 1 generation step per token = total_target_tokens steps
-        - With speculation: Need total_positions steps (some steps generate multiple tokens)
+        - With speculation: Need total_verification_cost steps accounting for verification overhead
         - Speedup shows how many times faster speculative decoding is
 
         Example: If speedup = 2.0, speculative decoding is 2x faster
         """
-        if self.total_positions == 0:
+        if self.total_verification_cost == 0:
             return 0.0
-        return self.total_target_tokens / self.total_positions
+        return self.total_target_tokens / self.total_verification_cost
 
 
 def analyze_instance(
@@ -566,34 +1070,73 @@ def analyze_instance(
     Returns:
         List of HitRatioResults (one per verification rollout)
     """
-    draft = instance.get_draft()
-    if draft is None:
-        logger.warning(f"Instance {instance.instance_id} has no draft rollout")
-        return []
+    if config.use_all_rollouts:
+        # Mode: Use all other rollouts as drafts for each target rollout
+        if len(instance.rollouts) < 2:
+            logger.warning(f"Instance {instance.instance_id} has fewer than 2 rollouts")
+            return []
 
-    verification_rollouts = instance.get_verification_rollouts()
-    if not verification_rollouts:
-        logger.warning(f"Instance {instance.instance_id} has no verification rollouts")
-        return []
+        results: list[HitRatioResult] = []
 
-    # Tokenize draft
-    draft_tokens = tokenize_text(tokenizer, draft.assistant_content)
+        # For each rollout, use all other rollouts as drafts
+        for target_rollout in instance.rollouts:
+            # Get all other rollouts as drafts
+            draft_rollouts = [r for r in instance.rollouts if r.rollout_id != target_rollout.rollout_id]
 
-    results: list[HitRatioResult] = []
+            # Tokenize all drafts
+            all_draft_tokens = [tokenize_text(tokenizer, r.assistant_content) for r in draft_rollouts]
 
-    for rollout in verification_rollouts:
-        target_tokens = tokenize_text(tokenizer, rollout.assistant_content)
+            # Tokenize target
+            target_tokens = tokenize_text(tokenizer, target_rollout.assistant_content)
 
-        result = calculate_hit_ratio(
-            draft_tokens=draft_tokens,
-            target_tokens=target_tokens,
-            k=config.k,
-            context_size=config.context_size,
-            use_longest_match=config.use_longest_match,
-        )
-        results.append(result)
+            result = calculate_hit_ratio_multi_draft(
+                all_draft_tokens=all_draft_tokens,
+                target_tokens=target_tokens,
+                k=config.k,
+                tokenizer=tokenizer,
+                context_size=config.context_size,
+                use_longest_match=config.use_longest_match,
+                use_char_fallback=config.use_char_fallback,
+                char_threshold=config.char_threshold,
+                per_token_verification_overhead=config.per_token_verification_overhead,
+            )
+            results.append(result)
 
-    return results
+        return results
+    else:
+        # Mode: Use only rollout_id=0 as draft for all other rollouts
+        draft = instance.get_draft()
+        if draft is None:
+            logger.warning(f"Instance {instance.instance_id} has no draft rollout")
+            return []
+
+        verification_rollouts = instance.get_verification_rollouts()
+        if not verification_rollouts:
+            logger.warning(f"Instance {instance.instance_id} has no verification rollouts")
+            return []
+
+        # Tokenize draft
+        draft_tokens = tokenize_text(tokenizer, draft.assistant_content)
+
+        results: list[HitRatioResult] = []
+
+        for rollout in verification_rollouts:
+            target_tokens = tokenize_text(tokenizer, rollout.assistant_content)
+
+            result = calculate_hit_ratio(
+                draft_tokens=draft_tokens,
+                target_tokens=target_tokens,
+                k=config.k,
+                tokenizer=tokenizer,
+                context_size=config.context_size,
+                use_longest_match=config.use_longest_match,
+                use_char_fallback=config.use_char_fallback,
+                char_threshold=config.char_threshold,
+                per_token_verification_overhead=config.per_token_verification_overhead,
+            )
+            results.append(result)
+
+        return results
 
 
 def run_analysis(
@@ -642,6 +1185,7 @@ def run_analysis(
         instance_context_len = sum(r.total_context_length for r in instance_results)
         instance_candidates = sum(r.total_candidates for r in instance_results)
         instance_target_tokens = sum(r.total_target_tokens for r in instance_results)
+        instance_verification_cost = sum(r.total_verification_cost for r in instance_results)
 
         # Aggregate hit_lengths distribution
         for result in instance_results:
@@ -660,6 +1204,7 @@ def run_analysis(
         aggregated.total_context_length += instance_context_len
         aggregated.total_candidates += instance_candidates
         aggregated.total_target_tokens += instance_target_tokens
+        aggregated.total_verification_cost += instance_verification_cost
 
     return aggregated
 
@@ -672,8 +1217,15 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
     print(f"Model: {config.model_path}")
     print(f"Context size (n-gram): {config.context_size}")
     print(f"Speculation length (k): {config.k}")
+    print(f"Per-token verification overhead: {config.per_token_verification_overhead}")
     match_strategy = "longest match" if config.use_longest_match else "first match"
     print(f"Matching strategy: {match_strategy}")
+    rollout_mode = "all other rollouts" if config.use_all_rollouts else "rollout_id=0 only"
+    print(f"Draft rollout mode: {rollout_mode}")
+    char_fallback_status = "enabled" if config.use_char_fallback else "disabled"
+    print(f"Character fallback: {char_fallback_status}")
+    if config.use_char_fallback:
+        print(f"  Character threshold: {config.char_threshold} chars")
     print("-" * 80)
 
     print(f"\nOverall Metrics:")
@@ -714,6 +1266,33 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
     print("  - Hit length distribution: Cumulative count of cases where >= N consecutive tokens matched")
     print("    (e.g., 'Length 3' shows how many cases had >= 3 tokens matching)")
     print("")
+    print("Matching strategy:")
+    if config.use_char_fallback:
+        print("  - Hybrid token/character matching:")
+        print("    1. First tries token-based n-gram matching")
+        print(f"    2. If no match, falls back to character-based matching (min {config.char_threshold} chars)")
+        if config.use_longest_match:
+            print("    3. Longest match: finds the longest matching context")
+        else:
+            print("    3. First match: returns as soon as a match is found")
+    else:
+        print("  - Token-based matching only:")
+        print("    Uses n-gram token matching")
+        if config.use_longest_match:
+            print("    Longest match: finds the longest matching context")
+        else:
+            print("    First match: returns as soon as a match is found")
+    print("")
+    print("Draft rollout mode:")
+    if config.use_all_rollouts:
+        print("  - All other rollouts: For each rollout, all other rollouts are used as drafts")
+        if config.use_longest_match:
+            print("    Longest match strategy finds the best match across all drafts")
+        else:
+            print("    First match strategy returns as soon as a match is found in any draft")
+    else:
+        print("  - Single draft (rollout_id=0): Only the first rollout is used as draft for all others")
+    print("")
 
 
 def save_results(
@@ -728,6 +1307,10 @@ def save_results(
             "context_size": config.context_size,
             "model_path": config.model_path,
             "use_longest_match": config.use_longest_match,
+            "use_all_rollouts": config.use_all_rollouts,
+            "use_char_fallback": config.use_char_fallback,
+            "char_threshold": config.char_threshold,
+            "per_token_verification_overhead": config.per_token_verification_overhead,
         },
         "results": {
             "k_value": results.k_value,
@@ -741,6 +1324,7 @@ def save_results(
             "total_context_length": results.total_context_length,
             "total_candidates": results.total_candidates,
             "total_target_tokens": results.total_target_tokens,
+            "total_verification_cost": results.total_verification_cost,
             "speedup": results.overall_speedup,
             "hit_ratio": results.overall_hit_ratio,
             "context_found_rate": results.context_found_rate,
@@ -796,6 +1380,30 @@ def main():
         help="If set, use first match instead of longest match (default: use longest match)",
     )
     parser.add_argument(
+        "--use-all-rollouts",
+        action="store_true",
+        default=False,
+        help="If set, use all other rollouts as drafts for each target (default: use only rollout_id=0)",
+    )
+    parser.add_argument(
+        "--use-char-fallback",
+        action="store_true",
+        default=False,
+        help="If set, use character-based fallback when token matching fails (default: False)",
+    )
+    parser.add_argument(
+        "--char-threshold",
+        type=int,
+        default=5,
+        help="Minimum character length for character-based fallback matching (default: 5)",
+    )
+    parser.add_argument(
+        "--per-token-verification-overhead",
+        type=float,
+        default=0.0,
+        help="Cost per token verified (default: 0.0)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
@@ -819,6 +1427,10 @@ def main():
         context_size=args.context_size,
         model_path=args.model,
         use_longest_match=not args.use_first_match,
+        use_all_rollouts=args.use_all_rollouts,
+        use_char_fallback=args.use_char_fallback,
+        char_threshold=args.char_threshold,
+        per_token_verification_overhead=args.per_token_verification_overhead,
     )
 
     logger.info(f"Loading rollouts from {args.input}")
@@ -829,7 +1441,8 @@ def main():
         return 1
 
     match_strategy = "longest match" if config.use_longest_match else "first match"
-    logger.info(f"Running analysis with k={config.k}, context_size={config.context_size}, strategy={match_strategy}")
+    rollout_mode = "all other rollouts" if config.use_all_rollouts else "rollout_id=0 only"
+    logger.info(f"Running analysis with k={config.k}, context_size={config.context_size}, strategy={match_strategy}, rollout_mode={rollout_mode}")
     results = run_analysis(instances, tokenizer, config)
 
     print_results(results, config)
