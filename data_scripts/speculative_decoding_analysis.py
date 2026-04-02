@@ -9,8 +9,14 @@ Given multiple rollouts per prompt, it can operate in two modes:
 
 The matching scheme:
 - Uses token-based n-gram matching with longest match strategy
-- If found, use the next k tokens from the draft as speculation candidates
-- Count how many of these speculated tokens match the actual target tokens
+- Optionally, when using --use-all-rollouts --use-two-prefix-algorithm, computes dynamic k from suffix:
+  1. First, finds matches using longest match strategy (same as default)
+  2. For each match found, tries to find a second prefix with longest common end portion (>= context_size)
+  3. Computes longest common suffix between tokens AFTER the two prefixes in their rollouts
+  4. Uses max(k, suffix_length) as dynamic k (minimum value is k, can be larger)
+  5. If no second prefix found or suffix length is 0, uses original k value
+- Speculates the next dynamic_k tokens from the draft as candidates
+- Counts how many of these speculated tokens match the actual target tokens
 
 Usage:
     python speculative_decoding_analysis.py --input all_rollouts.jsonl
@@ -18,6 +24,7 @@ Usage:
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --k 4
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --context-size 4 --k 5
     python speculative_decoding_analysis.py --input all_rollouts.jsonl --use-all-rollouts
+    python speculative_decoding_analysis.py --input all_rollouts.jsonl --use-all-rollouts --use-two-prefix-algorithm
 """
 
 import argparse
@@ -311,6 +318,56 @@ def find_longest_match(
     return None
 
 
+def find_longest_common_suffix(tokens1: list[int], tokens2: list[int]) -> int:
+    """
+    Find the length of the longest common suffix between two token sequences.
+
+    Args:
+        tokens1: First token sequence
+        tokens2: Second token sequence
+
+    Returns:
+        Length of the longest common suffix
+    """
+    suffix_len = 0
+    min_len = min(len(tokens1), len(tokens2))
+
+    for i in range(1, min_len + 1):
+        if tokens1[-i] == tokens2[-i]:
+            suffix_len = i
+        else:
+            break
+
+    return suffix_len
+
+
+def find_longest_common_end_portion(prefix1: list[int], prefix2: list[int], min_length: int) -> int:
+    """
+    Find the longest common end portion between two prefixes.
+    The common end portion must be at least min_length.
+
+    Args:
+        prefix1: First prefix
+        prefix2: Second prefix
+        min_length: Minimum length of common end portion
+
+    Returns:
+        Length of the longest common end portion (0 if less than min_length)
+    """
+    max_len = min(len(prefix1), len(prefix2))
+
+    # Start from min_length and find the longest match
+    best_len = 0
+    for length in range(min_length, max_len + 1):
+        if prefix1[-length:] == prefix2[-length:]:
+            best_len = length
+        else:
+            # No longer matching, stop
+            break
+
+    return best_len
+
+
 def find_longest_match_multi_draft(
     target_tokens: list[int],
     pos: int,
@@ -352,6 +409,84 @@ def find_longest_match_multi_draft(
         return (best_draft_idx, best_draft_pos, best_context_len, total_candidates)
 
     return None
+
+
+def compute_dynamic_k_from_suffix(
+    best_draft_idx: int,
+    best_draft_pos: int,
+    best_context_len: int,
+    all_draft_tokens: list[list[int]],
+    all_matches: list[tuple[int, int, int, int]],
+    min_context: int,
+    k: int,
+) -> int:
+    """
+    Compute dynamic k based on longest common suffix between two prefixes.
+
+    Algorithm:
+    1. Use the already-found longest prefix (best_draft_idx)
+    2. Find a second prefix with longest common end portion
+    3. Compute longest common suffix between tokens AFTER the two prefixes
+    4. Return max(k, suffix_length) as dynamic k (minimum value is k)
+    5. If no valid second prefix or suffix is 0, return original k
+
+    Args:
+        best_draft_idx: Index of the draft with longest prefix
+        best_draft_pos: Position of the longest prefix in that draft
+        best_context_len: Length of the longest prefix
+        all_draft_tokens: List of all draft token sequences
+        all_matches: List of all matches found (draft_idx, draft_pos, ctx_len, num_candidates)
+        min_context: Minimum context size for common end portion
+        k: Original k value (also minimum value for dynamic k)
+
+    Returns:
+        dynamic_k: max(k, suffix_length) - always at least k
+    """
+    # Extract the first prefix
+    prefix1 = all_draft_tokens[best_draft_idx][best_draft_pos:best_draft_pos + best_context_len]
+
+    # Find the second prefix with longest common end portion
+    best_second_draft_idx = None
+    best_second_draft_pos = None
+    best_second_context_len = 0
+    best_end_portion_len = 0
+    best_suffix_len = 0
+
+    for draft_idx, draft_pos, ctx_len, _ in all_matches:
+        # Skip the first draft
+        if draft_idx == best_draft_idx:
+            continue
+
+        # Extract this prefix
+        prefix2 = all_draft_tokens[draft_idx][draft_pos:draft_pos + ctx_len]
+
+        # Find the longest common end portion between the prefixes
+        end_portion_len = find_longest_common_end_portion(prefix1, prefix2, min_context)
+
+        if end_portion_len >= min_context:
+            # Get tokens AFTER the prefixes in their respective rollouts
+            tokens_after_prefix1 = all_draft_tokens[best_draft_idx][best_draft_pos + best_context_len:]
+            tokens_after_prefix2 = all_draft_tokens[draft_idx][draft_pos + ctx_len:]
+
+            # Find the longest common suffix between tokens after the prefixes
+            suffix_len = find_longest_common_suffix(tokens_after_prefix1, tokens_after_prefix2)
+
+            # Select the prefix with longest end portion, or longest suffix if tied
+            if (end_portion_len > best_end_portion_len or
+                (end_portion_len == best_end_portion_len and suffix_len > best_suffix_len)):
+                best_end_portion_len = end_portion_len
+                best_second_draft_idx = draft_idx
+                best_second_draft_pos = draft_pos
+                best_second_context_len = ctx_len
+                best_suffix_len = suffix_len
+
+    # Return dynamic k (minimum value is k)
+    if best_second_draft_idx is None or best_suffix_len == 0:
+        # No valid second prefix found or suffix is 0, use original k
+        return k
+    else:
+        # Return max of k and suffix length (dynamic k is at least k)
+        return max(k, best_suffix_len)
 
 
 def calculate_hit_ratio(
@@ -492,22 +627,27 @@ def calculate_hit_ratio_multi_draft(
     k: int,
     context_size: int = 3,
     per_token_verification_overhead: float = 0.0,
+    use_two_prefix_algorithm: bool = False,
 ) -> HitRatioResult:
     """
     Calculate hit ratio for speculative decoding using multiple draft sequences.
 
     For each position in the target (after context_size tokens), we:
-    1. Try token-based n-gram matching (longest match) across all drafts
-    2. If found, speculate the next k tokens from the best draft
-    3. Count how many of these match the actual target tokens
-    4. Skip forward by the number of accepted tokens (or 1 if none accepted)
+    1. Find matches using longest match strategy across all drafts
+    2. If use_two_prefix_algorithm is True, compute dynamic k based on suffix analysis
+       - dynamic k = max(k, suffix_length), so always at least k
+    3. Otherwise, use original k
+    4. Speculate the next dynamic_k tokens from the best draft
+    5. Count how many of these match the actual target tokens
+    6. Skip forward by the number of accepted tokens (or 1 if none accepted)
 
     Args:
         all_draft_tokens: List of token ID sequences from draft responses
         target_tokens: Token IDs from the target response
-        k: Number of tokens to speculate
+        k: Number of tokens to speculate (also minimum value for dynamic k)
         context_size: Minimum context window size for n-gram matching
         per_token_verification_overhead: Cost per token verified (default: 0.0)
+        use_two_prefix_algorithm: If True, compute dynamic k from suffix analysis (default: False)
 
     Returns:
         HitRatioResult with hit statistics
@@ -534,31 +674,66 @@ def calculate_hit_ratio_multi_draft(
     while pos < len(target_tokens):
         total_positions += 1
 
-        # Try token-based matching (longest match)
-        match = find_longest_match_multi_draft(
-            target_tokens, pos, all_draft_tokens, all_draft_indices,
-            min_context=context_size,
-        )
+        # Always use longest match algorithm to find matches
+        # Need to collect all matches if use_two_prefix_algorithm is True
+        if use_two_prefix_algorithm:
+            # Collect all matches for suffix computation
+            all_matches = []
+            best_draft_idx = None
+            best_draft_pos = None
+            best_context_len = 0
+            total_candidates = 0
 
-        draft_idx = None
-        draft_pos = None
-        ctx_len = 0
-        num_candidates = 0
+            for draft_idx, (draft_tokens, draft_index) in enumerate(zip(all_draft_tokens, all_draft_indices)):
+                match = find_longest_match(target_tokens, pos, draft_tokens, draft_index, context_size)
 
-        if match is not None:
+                if match is not None:
+                    draft_pos, ctx_len, num_candidates = match
+                    all_matches.append((draft_idx, draft_pos, ctx_len, num_candidates))
+                    total_candidates += num_candidates
+
+                    if ctx_len > best_context_len:
+                        best_context_len = ctx_len
+                        best_draft_pos = draft_pos
+                        best_draft_idx = draft_idx
+
+            if best_draft_idx is None:
+                # No match found
+                total_verification_cost += 1.0
+                pos += 1
+                continue
+
+            # Compute dynamic k based on suffix analysis
+            dynamic_k = compute_dynamic_k_from_suffix(
+                best_draft_idx, best_draft_pos, best_context_len,
+                all_draft_tokens, all_matches, context_size, k
+            )
+
+            draft_idx = best_draft_idx
+            draft_pos = best_draft_pos
+            ctx_len = best_context_len
+            num_candidates = total_candidates
+        else:
+            # Use find_longest_match_multi_draft (more efficient when not computing suffix)
+            match = find_longest_match_multi_draft(
+                target_tokens, pos, all_draft_tokens, all_draft_indices,
+                min_context=context_size,
+            )
+
+            if match is None:
+                # No match found
+                total_verification_cost += 1.0
+                pos += 1
+                continue
+
             draft_idx, draft_pos, ctx_len, num_candidates = match
-
-        if draft_idx is None or draft_pos is None:
-            # No match found, generate 1 token normally (cost = 1)
-            total_verification_cost += 1.0
-            pos += 1
-            continue
+            dynamic_k = k  # Use original k
 
         context_found_positions += 1
 
         # Get speculated tokens from the best draft (tokens after the matched context)
         spec_start = draft_pos + ctx_len
-        spec_end = min(spec_start + k, len(all_draft_tokens[draft_idx]))
+        spec_end = min(spec_start + dynamic_k, len(all_draft_tokens[draft_idx]))
         speculated_tokens = all_draft_tokens[draft_idx][spec_start:spec_end]
 
         if not speculated_tokens:
@@ -589,9 +764,8 @@ def calculate_hit_ratio_multi_draft(
         hit_lengths[hits] += 1
 
         # Calculate verification cost for this position
-        # Cost = 1 + per_token_verification_overhead * (k - 1)
-        # This assumes we always verify k tokens at each matching position
-        verification_cost = 1.0 + (k - 1) * per_token_verification_overhead
+        # Cost = 1 + per_token_verification_overhead * (dynamic_k - 1)
+        verification_cost = 1.0 + (dynamic_k - 1) * per_token_verification_overhead
         total_verification_cost += verification_cost
 
         # Move forward based on accepted tokens
@@ -628,6 +802,7 @@ class AnalysisConfig:
     model_path: str = ""
     use_all_rollouts: bool = False  # If True, use all other rollouts as drafts; if False, use only rollout_id=0
     per_token_verification_overhead: float = 0.0  # Cost per token verified
+    use_two_prefix_algorithm: bool = False  # If True, compute dynamic k from suffix analysis (only applies when use_all_rollouts=True)
 
 
 @dataclass
@@ -742,6 +917,7 @@ def analyze_instance(
                 k=config.k,
                 context_size=config.context_size,
                 per_token_verification_overhead=config.per_token_verification_overhead,
+                use_two_prefix_algorithm=config.use_two_prefix_algorithm,
             )
             results.append(result)
 
@@ -907,7 +1083,15 @@ def print_results(results: AggregatedResults, config: AnalysisConfig) -> None:
     print("Draft rollout mode:")
     if config.use_all_rollouts:
         print("  - All other rollouts: For each rollout, all other rollouts are used as drafts")
-        print("    Longest match strategy finds the best match across all drafts")
+        if config.use_two_prefix_algorithm:
+            print("    Dynamic k computation: ENABLED")
+            print("      1. Finds matches using longest match strategy")
+            print("      2. Finds second prefix with longest common end portion (>= context_size)")
+            print("      3. Computes longest common suffix between tokens AFTER the two prefixes")
+            print("      4. Uses max(k, suffix_length) as dynamic k (minimum is k, can be larger)")
+            print("      5. If no second prefix or suffix is 0, uses original k value")
+        else:
+            print("    Dynamic k computation: DISABLED (using fixed k)")
     else:
         print("  - Single draft (rollout_id=0): Only the first rollout is used as draft for all others")
     print("")
@@ -926,6 +1110,7 @@ def save_results(
             "model_path": config.model_path,
             "use_all_rollouts": config.use_all_rollouts,
             "per_token_verification_overhead": config.per_token_verification_overhead,
+            "use_two_prefix_algorithm": config.use_two_prefix_algorithm,
         },
         "results": {
             "k_value": results.k_value,
@@ -1001,6 +1186,12 @@ def main():
         help="Cost per token verified (default: 0.0)",
     )
     parser.add_argument(
+        "--use-two-prefix-algorithm",
+        action="store_true",
+        default=False,
+        help="If set, compute dynamic k from suffix analysis (only applies when --use-all-rollouts is True) (default: False)",
+    )
+    parser.add_argument(
         "--output",
         type=str,
         default=None,
@@ -1025,6 +1216,7 @@ def main():
         model_path=args.model,
         use_all_rollouts=args.use_all_rollouts,
         per_token_verification_overhead=args.per_token_verification_overhead,
+        use_two_prefix_algorithm=args.use_two_prefix_algorithm,
     )
 
     logger.info(f"Loading rollouts from {args.input}")
