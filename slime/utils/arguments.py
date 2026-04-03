@@ -430,6 +430,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--swe-docker-startup-concurrency",
+                type=int,
+                default=4,
+                help=(
+                    "Maximum number of concurrent SWE-agent Docker environment startups. "
+                    "Set to 1 to fully serialize container boot."
+                ),
+            )
+            parser.add_argument(
+                "--swe-docker-startup-timeout-seconds",
+                type=int,
+                default=900,
+                help=(
+                    "Timeout in seconds for each SWE-agent Docker runtime startup. "
+                    "Increase this when containers need to install swe-rex/pipx at boot."
+                ),
+            )
+            parser.add_argument(
                 "--pipeline-rl-k",
                 type=int,
                 default=None,
@@ -440,6 +458,61 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "This is currently consumed by "
                     "examples/fully_async/fully_async_rollout.py."
                 ),
+            )
+            parser.add_argument(
+                "--swe-hardcoded-response-mode",
+                type=str,
+                choices=["none", "program"],
+                default="none",
+                help=(
+                    "SWE debug mode for custom generate path. "
+                    "'program' uses a deterministic hardcoded multi-turn tool-call program."
+                ),
+            )
+            parser.add_argument(
+                "--swe-hardcoded-program-path",
+                type=str,
+                default="/root/repo/slime/examples/swe_bench/hardcoded_programs/hardcoded_program.yaml",
+                help="Path to YAML/JSON hardcoded response program used when --swe-hardcoded-response-mode=program.",
+            )
+            parser.add_argument(
+                "--swe-eval-reward-enable",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable SWE eval-based task reward for custom SWE reward post-processing. "
+                    "When enabled, resolved samples receive +1 and all other outcomes receive -1."
+                ),
+            )
+            parser.add_argument(
+                "--swe-eval-logs-root",
+                type=str,
+                default="/root/repo/slime/outputs/swe_eval_reward_logs",
+                help="Root directory for SWE eval reward runner logs/artifacts.",
+            )
+            parser.add_argument(
+                "--swe-eval-timeout-seconds",
+                type=int,
+                default=3600,
+                help="Timeout in seconds for each SWE eval reward subprocess call.",
+            )
+            parser.add_argument(
+                "--swe-eval-jsonl-path",
+                type=str,
+                default=None,
+                help="Path to eval dataset jsonl used by SWE eval runner.",
+            )
+            parser.add_argument(
+                "--swe-eval-workers",
+                type=int,
+                default=1,
+                help="Workers for SWE eval runner invocation.",
+            )
+            parser.add_argument(
+                "--swe-eval-pytest-timeout-seconds",
+                type=int,
+                default=1800,
+                help="Pytest timeout passed to SWE eval runner.",
             )
             parser.add_argument(
                 "--custom-generate-function-path",

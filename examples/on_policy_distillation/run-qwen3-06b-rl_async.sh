@@ -110,7 +110,7 @@ ROLLOUT_ARGS=(
    --rollout-top-p 0.8
    --rollout-top-k 20
    --use-rollout-logprobs
-   --pipeline-rl-k 2
+   --pipeline-rl-k 8
    --rollout-sample-filter-path slime.rollout.filter_hub.sample_filters.mark_truncated_samples_inactive
    --rollout-function-path examples.fully_async.fully_async_rollout.generate_rollout_fully_async
 

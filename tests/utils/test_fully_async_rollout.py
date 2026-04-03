@@ -25,6 +25,7 @@ def _make_args(**overrides):
     base = dict(
         rollout_global_dataset=True,
         rollout_batch_size=2,
+        n_samples_per_prompt=1,
         pipeline_rl_k=None,
         dynamic_sampling_filter_path=None,
         rollout_sample_filter_path=None,
@@ -163,6 +164,34 @@ def test_rollout_sample_filter_path_called_on_accepted_data():
     assert len(sample_filter_calls[0]) == 2
 
 
+def test_rollout_sample_filter_can_zero_weight_samples_without_dropping_group():
+    args = _make_args(rollout_batch_size=1, n_samples_per_prompt=2)
+    group = [_make_group(0)[0], _make_group(1)[0]]
+    group[0].status = Sample.Status.COMPLETED
+    group[0].metadata["info"] = {"exit_status": "submitted"}
+    group[1].status = Sample.Status.COMPLETED
+    group[1].metadata["info"] = {"exit_status": "none"}
+    data_buffer = MagicMock()
+    fake_worker = FakeWorker([group])
+
+    from examples.swe_bench.rollout_hooks import mark_swe_non_submitted_samples_inactive
+
+    with patch("examples.fully_async.fully_async_rollout.get_global_worker", return_value=fake_worker), \
+         patch("examples.fully_async.fully_async_rollout.load_function", return_value=mark_swe_non_submitted_samples_inactive):
+        args_with_filter = _make_args(
+            rollout_batch_size=1,
+            n_samples_per_prompt=2,
+            rollout_sample_filter_path="examples.swe_bench.rollout_hooks.mark_swe_non_submitted_samples_inactive",
+        )
+        from examples.fully_async.fully_async_rollout import generate_rollout_async
+        result = _run(generate_rollout_async(args_with_filter, rollout_id=0, data_buffer=data_buffer))
+
+    assert len(result.samples) == 1
+    assert len(result.samples[0]) == 2
+    assert result.samples[0][0].remove_sample is False
+    assert result.samples[0][1].remove_sample is True
+
+
 def test_rollout_all_samples_process_path_called_with_bound_method():
     """rollout_all_samples_process_path receives data_buffer.get_samples (bound method)."""
     args = _make_args()
@@ -265,6 +294,32 @@ def test_completed_group_rejected_by_dynamic_filter_is_not_recycled():
 
     assert len(result.samples) == 1
     assert result.samples[0][0].index == 1
+    data_buffer.add_samples.assert_not_called()
+
+
+def test_swe_dynamic_filter_hook_drops_non_submitted_completed_group():
+    args = _make_args(rollout_batch_size=1)
+    rejected_group = _make_group(0)
+    rejected_group[0].status = Sample.Status.COMPLETED
+    rejected_group[0].metadata["info"] = {"exit_status": "none"}
+    accepted_group = _make_group(1)
+    accepted_group[0].status = Sample.Status.COMPLETED
+    accepted_group[0].metadata["info"] = {"exit_status": "submitted"}
+    data_buffer = MagicMock()
+
+    fake_worker = FakeWorker([rejected_group, accepted_group])
+
+    from examples.swe_bench.rollout_hooks import filter_swe_completed_and_submitted
+
+    with patch("examples.fully_async.fully_async_rollout.get_global_worker", return_value=fake_worker), \
+         patch("examples.fully_async.fully_async_rollout.load_function", return_value=filter_swe_completed_and_submitted):
+        args_f = _make_args(rollout_batch_size=1, dynamic_sampling_filter_path="examples.swe_bench.rollout_hooks.filter_swe_completed_and_submitted")
+        from examples.fully_async.fully_async_rollout import generate_rollout_async
+        result = _run(generate_rollout_async(args_f, rollout_id=0, data_buffer=data_buffer))
+
+    assert len(result.samples) == 1
+    assert result.samples[0][0].index == 1
+    assert result.metrics["rollout/dynamic_filter/drop_swe_not_submitted"] == 1
     data_buffer.add_samples.assert_not_called()
 
 

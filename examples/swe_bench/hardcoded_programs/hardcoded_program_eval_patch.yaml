@@ -1,0 +1,22 @@
+action_cycle:
+  - create
+
+file_path_prefix: /testbed/slime_eval_probe
+
+submit:
+  enabled: true
+  base_turn: 2
+  spread: 1
+  task_completed: true
+  message: "Eval probe submit for {instance_id} at turn {turn}."
+
+templates:
+  create_discussion: "Hardcoded eval probe: append a deterministic marker to tracked file for {instance_id} at turn {turn}."
+  create_message_template: |
+    DISCUSSION
+    Hardcoded eval probe: append a deterministic marker to tracked file for {instance_id} at turn {turn}.
+
+    <function=bash>
+    <parameter=command>printf '\n# slime_eval_probe {session_short} turn={turn}\n' >> /testbed/setup.py</parameter>
+    </function>
+  finish_discussion: "Hardcoded eval probe: submit gate reached for {instance_id}."

@@ -1,8 +1,7 @@
 #!/bin/bash
 
-# SWE-bench on-policy distillation training script
-# Usage: bash examples/swe_bench/run-qwen3-06B-opd.sh
-
+pkill -9 sglang
+sleep 3
 ray stop --force
 pkill -9 ray
 sleep 3
@@ -45,13 +44,18 @@ TEACHER_IP="127.0.0.1"
 TEACHER_PORT=4500
 LOG_FILE="/tmp/sglang_$(head /dev/urandom | tr -dc A-Za-z0-9 | head -c 6).log"
 
-CUDA_VISIBLE_DEVICES=1 python3 -m sglang.launch_server \
-    --model-path /root/data/hf_models/Qwen3-0.6B \
+python3 -m sglang.launch_server \
+    --model-path /root/data/hf_models/Qwen3-Coder-30B-A3B-Instruct-FP8 \
     --host 0.0.0.0 \
     --port $TEACHER_PORT \
-    --tp 1 \
-    --chunked-prefill-size 4096 \
-    --mem-fraction-static 0.2 \
+    --tp 2 \
+    --ep 2 \
+    --context-length 64000 \
+    --fp8-gemm-backend triton \
+    --moe-runner-backend triton \
+    --kv-cache-dtype fp8_e4m3 \
+    --mem-fraction-static 0.8 \
+    --disable-cuda-graph \
     > "$LOG_FILE" 2>&1 &
 
 echo "Starting teacher model server..."
@@ -92,7 +96,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "/root/repo/slime/.env"
-source "/root/repo/slime/scripts/models/qwen3-0.6B.sh"
+source "/root/repo/slime/scripts/models/qwen3-4B-Instruct-2507.sh"
 
 TIMESTAMP=$(date +"%Y_%m_%d_%H_%M_%S")
 if [ -z "${RAY_HEAD_PORT:-}" ]; then
@@ -106,24 +110,22 @@ if [ "${RAY_DASHBOARD_PORT}" = "${RAY_HEAD_PORT}" ]; then
 fi
 RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray_swe_${TIMESTAMP}_$$}
 echo "Using Ray ports: head=${RAY_HEAD_PORT}, dashboard=${RAY_DASHBOARD_PORT}"
+RAY_HEAD_NUM_GPUS=${RAY_HEAD_NUM_GPUS:-0}
+SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER=${SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER:-1}
 
-NUM_ROLLOUT=${NUM_ROLLOUT:-50}
-ROLLOUT_BATCH_SIZE=${ROLLOUT_BATCH_SIZE:-4}
-GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-4}
-N_SAMPLES_PER_PROMPT=${N_SAMPLES_PER_PROMPT:-2}
-ROLLOUT_MAX_RESPONSE_LEN=${ROLLOUT_MAX_RESPONSE_LEN:-4096}
-SWE_DOCKER_STARTUP_CONCURRENCY=${SWE_DOCKER_STARTUP_CONCURRENCY:-80}
-SWE_DOCKER_STARTUP_TIMEOUT_SECONDS=${SWE_DOCKER_STARTUP_TIMEOUT_SECONDS:-900}
-ROLLOUT_SAMPLE_FILTER_PATH=${ROLLOUT_SAMPLE_FILTER_PATH:-examples.swe_bench.rollout_hooks.mark_swe_non_submitted_samples_inactive}
-SWE_HARDCODED_RESPONSE_MODE=${SWE_HARDCODED_RESPONSE_MODE:-program}
-SWE_HARDCODED_PROGRAM_PATH=${SWE_HARDCODED_PROGRAM_PATH:-/root/repo/slime/examples/swe_bench/hardcoded_programs/hardcoded_program_eval_patch.yaml}
-MAX_TOKENS_PER_GPU=${MAX_TOKENS_PER_GPU:-2048}
-SWE_EVAL_REWARD_ENABLE=${SWE_EVAL_REWARD_ENABLE:-1}
-SWE_EVAL_LOGS_ROOT=${SWE_EVAL_LOGS_ROOT:-/root/repo/slime/outputs/swe_eval_reward_logs/${TIMESTAMP}}
-SWE_EVAL_TIMEOUT_SECONDS=${SWE_EVAL_TIMEOUT_SECONDS:-300}
-SWE_EVAL_JSONL_PATH=${SWE_EVAL_JSONL_PATH:-/root/data/swe_mirror/dataset/all_sources_combined_dataset.jsonl}
-SWE_EVAL_WORKERS=${SWE_EVAL_WORKERS:-4}
-SWE_EVAL_PYTEST_TIMEOUT_SECONDS=${SWE_EVAL_PYTEST_TIMEOUT_SECONDS:-180}
+# ROLLOUT_SAMPLE_FILTER_PATH=${ROLLOUT_SAMPLE_FILTER_PATH:-examples.swe_bench.rollout_hooks.mark_swe_non_submitted_samples_inactive}
+
+
+SWE_EVAL_REWARD_ENABLE=${SWE_EVAL_REWARD_ENABLE:-0}
+# SWE_EVAL_LOGS_ROOT=${SWE_EVAL_LOGS_ROOT:-/root/repo/slime/outputs/swe_eval_reward_logs/${TIMESTAMP}}
+# SWE_EVAL_TIMEOUT_SECONDS=${SWE_EVAL_TIMEOUT_SECONDS:-300}
+# SWE_EVAL_JSONL_PATH=${SWE_EVAL_JSONL_PATH:-/root/data/swe_mirror/dataset/all_sources_combined_dataset.jsonl}
+# SWE_EVAL_WORKERS=${SWE_EVAL_WORKERS:-4}
+# SWE_EVAL_PYTEST_TIMEOUT_SECONDS=${SWE_EVAL_PYTEST_TIMEOUT_SECONDS:-180}
+
+
+# SWE_HARDCODED_RESPONSE_MODE=${SWE_HARDCODED_RESPONSE_MODE:-program}
+# SWE_HARDCODED_PROGRAM_PATH=${SWE_HARDCODED_PROGRAM_PATH:-/root/repo/slime/examples/swe_bench/hardcoded_programs/hardcoded_program_eval_patch.yaml}
 
 
 CKPT_ARGS=(
@@ -157,30 +159,27 @@ CUSTOM_ARGS=(
 
 ROLLOUT_ARGS=(
    # Prompt data for eval-reward mode uses SWE eval for all samples.
-   --prompt-data examples/swe_bench/data/train_mirror_patch_smoke.jsonl
+   --prompt-data examples/swe_bench/data/train_swe_bench.jsonl
    --input-key prompt
    # Don't apply chat template - we handle it in generate.py
    --rollout-shuffle
-   --num-rollout "${NUM_ROLLOUT}"
+   --num-rollout 255
 
    # Batch-fill rollout for variable-duration tasks
-   --rollout-batch-size "${ROLLOUT_BATCH_SIZE}"  # Number of samples to collect (increase to 64 for scale)
-   --n-samples-per-prompt "${N_SAMPLES_PER_PROMPT}"
-   --swe-docker-startup-concurrency "${SWE_DOCKER_STARTUP_CONCURRENCY}"  # Parallel startups without overwhelming swe-rex bootstrap
-   --swe-docker-startup-timeout-seconds "${SWE_DOCKER_STARTUP_TIMEOUT_SECONDS}"  # Avoid false startup timeout during pipx/swe-rex install
-   --partial-rollout  # Enable saving/resuming true aborted samples
-   --mask-offpolicy-in-partial-rollout  # Mask old tokens in resumed samples
+   --rollout-batch-size 4
+   --n-samples-per-prompt 2
+   --swe-docker-startup-concurrency 80  # Parallel startups without overwhelming swe-rex bootstrap
+   --swe-docker-startup-timeout-seconds 900  # Avoid false startup timeout during pipx/swe-rex install
+#    --mask-offpolicy-in-partial-rollout  # Mask old tokens in resumed samples
+#    --rollout-sample-filter-path "${ROLLOUT_SAMPLE_FILTER_PATH}"
 
-   --rollout-max-response-len "${ROLLOUT_MAX_RESPONSE_LEN}"  # Long context for multi-turn
+   --rollout-max-response-len 64000  # Long context for multi-turn
    --rollout-temperature 0.8
 
-   --global-batch-size "${GLOBAL_BATCH_SIZE}"  # For training (increase to 64 for scale)
+   --global-batch-size 8  # For training (increase to 64 for scale)
    --balance-data
 )
 
-if [ -n "${ROLLOUT_SAMPLE_FILTER_PATH}" ]; then
-   ROLLOUT_ARGS+=(--rollout-sample-filter-path "${ROLLOUT_SAMPLE_FILTER_PATH}")
-fi
 
 if [ "${SWE_HARDCODED_RESPONSE_MODE}" != "none" ]; then
    CUSTOM_ARGS+=(
@@ -217,8 +216,9 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --micro-batch-size 1
-   --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
+#    --micro-batch-size 1
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 64000
 )
 
 GRPO_ARGS=(
@@ -253,7 +253,9 @@ WANDB_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 1
-   --sglang-mem-fraction-static 0.6
+   --sglang-mem-fraction-static 0.8
+   --sglang-enable-fp32-lm-head
+   --partial-rollout
 )
 
 
@@ -261,8 +263,9 @@ MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --attention-backend flash
-   --cross-entropy-loss-fusion
-   --cross-entropy-fusion-impl te
+#    --cross-entropy-loss-fusion
+#    --cross-entropy-fusion-impl te
+   --fused-linear-cross-entropy
    --bf16
    --use-distributed-optimizer
    --use-precision-aware-optimizer
@@ -285,19 +288,24 @@ DEBUG_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --port ${RAY_HEAD_PORT} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=${RAY_DASHBOARD_PORT} --temp-dir ${RAY_TEMP_DIR}
+ray start --head --node-ip-address ${MASTER_ADDR} --port ${RAY_HEAD_PORT} --num-gpus ${RAY_HEAD_NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=${RAY_DASHBOARD_PORT} --temp-dir ${RAY_TEMP_DIR}
 
+RUNTIME_ENV_JSON=$(cat <<EOF
+{
+  "env_vars": {
+    "PYTHONPATH": "/root/Megatron-LM/:/root/swe_livup",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "SWE_AGENT_CONFIG_ROOT": "/root/swe_livup",
+    "SWE_AGENT_CACHE_ROOT": "/root/repo/slime/outputs/swe_agent_cache",
+    "SWE_AGENT_TRAJECTORY_DIR": "/root/repo/slime/outputs/swe_agent_trajectories",
+    "SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER": "${SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER}"
+  }
+}
+EOF
+)
 
 ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
-   --runtime-env-json='{
-      "env_vars": {
-         "PYTHONPATH": "/root/Megatron-LM/:/root/swe_livup",
-         "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-         "SWE_AGENT_CONFIG_ROOT": "/root/swe_livup",
-         "SWE_AGENT_CACHE_ROOT": "/root/repo/slime/outputs/swe_agent_cache",
-         "SWE_AGENT_TRAJECTORY_DIR": "/root/repo/slime/outputs/swe_agent_trajectories"
-      }
-   }' \
+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_async.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 1 \
