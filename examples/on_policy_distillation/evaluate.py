@@ -21,6 +21,12 @@ python evaluate.py --vllm --port 8000 --model-name my-model --temperature 0.8 --
 
 # Save detailed results
 python evaluate.py --vllm --num-samples 100 --output results/eval_results.json
+
+# Save passing rollouts (first successful rollout per prompt) to a JSONL file
+python evaluate.py --vllm --num-samples 100 --attempts 3 --save-passing-rollouts --passing-rollouts-output passing_rollouts.jsonl
+
+# Save all rollouts to a JSONL file
+python evaluate.py --vllm --num-samples 100 --attempts 3 --save-all-rollouts --passing-rollouts-output all_rollouts.jsonl
 """
 
 import argparse
@@ -492,11 +498,15 @@ def evaluate(
     logger.info("="*60)
 
     # Run evaluation for multiple attempts
+    attempt_times = []
+    attempt_p90_times = []
     for attempt_num in range(attempts):
         logger.info(f"\n{'='*60}")
         logger.info(f"ATTEMPT {attempt_num + 1}/{attempts}")
         logger.info(f"{'='*60}\n")
+        attempt_start_time = time.time()
         attempt_results = {}
+        sample_completion_times = []  # Track when each sample completes
 
         # Use parallel processing for vLLM mode with multiple workers
         if use_vllm and vllm_workers > 1:
@@ -532,6 +542,10 @@ def evaluate(
                     all_results.append(result)
                     completed += 1
 
+                    # Track completion time for this sample
+                    completion_time = time.time() - attempt_start_time
+                    sample_completion_times.append(completion_time)
+
                     # Log progress
                     logger.info(f"Attempt {attempt_num + 1} - Completed {completed}/{len(samples)}")
 
@@ -558,12 +572,33 @@ def evaluate(
                 all_results.append(result)
                 attempt_results[idx] = result
 
+                # Track completion time for this sample
+                completion_time = time.time() - attempt_start_time
+                sample_completion_times.append(completion_time)
+
         if attempt_output_dir:
             write_attempt_results_file(
                 attempt_results=attempt_results,
                 attempt_num=attempt_num + 1,
                 output_dir=attempt_output_dir,
             )
+
+        # Record time for this attempt
+        attempt_time = time.time() - attempt_start_time
+        attempt_times.append(attempt_time)
+
+        # Calculate P90 time (time when 90% of samples completed)
+        if sample_completion_times:
+            sample_completion_times.sort()
+            p90_index = int(len(sample_completion_times) * 0.9)
+            # Ensure index is valid (at least 1, at most len-1)
+            p90_index = max(0, min(p90_index, len(sample_completion_times) - 1))
+            p90_time = sample_completion_times[p90_index]
+            attempt_p90_times.append(p90_time)
+            logger.info(f"\nAttempt {attempt_num + 1} completed in {attempt_time:.2f}s (P90: {p90_time:.2f}s)")
+        else:
+            attempt_p90_times.append(0.0)
+            logger.info(f"\nAttempt {attempt_num + 1} completed in {attempt_time:.2f}s")
 
     # Compute final metrics
     total = len(samples)
@@ -623,6 +658,8 @@ def evaluate(
         "results": all_results,
         "samples": samples,
         "per_sample_results": per_sample_results,
+        "attempt_times": attempt_times,
+        "attempt_p90_times": attempt_p90_times,
     }
 
 
@@ -708,6 +745,139 @@ def write_pass_rate_files(
     logger.info(f"  Pass rate 0.0: {len(no_pass)} samples")
     logger.info(f"  Pass rate partial: {len(partial_pass)} samples")
     logger.info(f"  Total: {len(full_pass) + len(no_pass) + len(partial_pass)} samples")
+
+
+def write_passing_rollouts(
+    samples: list[dict[str, Any]],
+    per_sample_results: dict[int, list[dict[str, Any]]],
+    output_file: str = "passing_rollouts.jsonl",
+) -> None:
+    """
+    Write the first passing rollout for each prompt to a JSONL file.
+
+    For each prompt, if there is at least one passing rollout, write the first one
+    in the format: {"instance_id": idx, "rollout_id": attempt_num, "messages": [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]}
+
+    Prompts with no passing rollouts are skipped.
+    Output is sorted by instance_id.
+    """
+    passing_rollouts = []
+
+    for idx in range(len(samples)):
+        sample = samples[idx]
+
+        # Find the first passing rollout for this prompt
+        first_passing = None
+        first_passing_rollout_id = None
+        for rollout_id, result in enumerate(per_sample_results[idx]):
+            if result.get("correct", False):
+                first_passing = result
+                first_passing_rollout_id = rollout_id
+                break
+
+        if first_passing is None:
+            # No passing rollouts for this prompt, skip it
+            continue
+
+        # Get the original prompt text
+        prompt = sample["prompt"]
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+            # Prompt is already in chat format, extract user content
+            user_content = None
+            for message in prompt:
+                if message.get("role") == "user":
+                    user_content = message.get("content", "")
+                    break
+            if user_content is None:
+                user_content = prompt[0].get("content", "")
+        else:
+            # Plain text prompt
+            user_content = str(prompt)
+
+        # Format as required: instance_id + rollout_id + messages
+        record = {
+            "instance_id": idx,
+            "rollout_id": first_passing_rollout_id,
+            "messages": [
+                {"role": "user", "content": user_content},
+                {"role": "assistant", "content": first_passing.get("response", "")},
+            ],
+        }
+        passing_rollouts.append(record)
+
+    # Sort by instance_id
+    passing_rollouts.sort(key=lambda x: x["instance_id"])
+
+    # Write to file
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, "w") as f:
+        for record in passing_rollouts:
+            f.write(json.dumps(record) + "\n")
+
+    logger.info(f"Written {len(passing_rollouts)} passing rollouts to {output_path}")
+    logger.info(f"  (Skipped {len(samples) - len(passing_rollouts)} prompts with no passing rollouts)")
+
+
+def write_all_rollouts(
+    samples: list[dict[str, Any]],
+    per_sample_results: dict[int, list[dict[str, Any]]],
+    output_file: str = "all_rollouts.jsonl",
+) -> None:
+    """
+    Write all rollouts for each prompt to a JSONL file.
+
+    For each prompt and each attempt, write a record in the format:
+    {"instance_id": idx, "rollout_id": attempt_num, "messages": [{"role": "user", "content": ...}, {"role": "assistant", "content": ...}]}
+
+    Output is sorted by (instance_id, rollout_id).
+    """
+    all_rollouts = []
+
+    for idx in range(len(samples)):
+        sample = samples[idx]
+
+        # Get the original prompt text
+        prompt = sample["prompt"]
+        if isinstance(prompt, list) and prompt and isinstance(prompt[0], dict):
+            # Prompt is already in chat format, extract user content
+            user_content = None
+            for message in prompt:
+                if message.get("role") == "user":
+                    user_content = message.get("content", "")
+                    break
+            if user_content is None:
+                user_content = prompt[0].get("content", "")
+        else:
+            # Plain text prompt
+            user_content = str(prompt)
+
+        # Write all rollouts for this prompt
+        for rollout_id, result in enumerate(per_sample_results[idx]):
+            record = {
+                "instance_id": idx,
+                "rollout_id": rollout_id,
+                "messages": [
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": result.get("response", "")},
+                ],
+            }
+            all_rollouts.append(record)
+
+    # Sort by (instance_id, rollout_id)
+    all_rollouts.sort(key=lambda x: (x["instance_id"], x["rollout_id"]))
+
+    # Write to file
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(output_path, "w") as f:
+        for record in all_rollouts:
+            f.write(json.dumps(record) + "\n")
+
+    logger.info(f"Written {len(all_rollouts)} rollouts to {output_path}")
+    logger.info(f"  ({len(samples)} prompts x {len(per_sample_results[0]) if per_sample_results else 0} attempts)")
 
 
 def main():
@@ -801,6 +971,24 @@ def main():
         default=None,
         help="Directory to write one JSONL file per attempt with prompt, response, and extracted answer",
     )
+    # Mutually exclusive group for rollout saving options
+    rollout_save_group = parser.add_mutually_exclusive_group()
+    rollout_save_group.add_argument(
+        "--save-passing-rollouts",
+        action="store_true",
+        help="Save the first passing rollout for each prompt to output file (with rollout_id)",
+    )
+    rollout_save_group.add_argument(
+        "--save-all-rollouts",
+        action="store_true",
+        help="Save all rollouts for each prompt to output file (with rollout_id)",
+    )
+    parser.add_argument(
+        "--passing-rollouts-output",
+        type=str,
+        default="passing_rollouts.jsonl",
+        help="Output file for rollouts (default: passing_rollouts.jsonl)",
+    )
 
     args = parser.parse_args()
 
@@ -822,7 +1010,14 @@ def main():
     logger.info(f"Max new tokens: {args.max_new_tokens}")
     logger.info(f"Temperature: {args.temperature}")
     logger.info(f"Sampling mode: {'greedy' if args.greedy else 'sampling'}")
+    if args.save_passing_rollouts:
+        logger.info(f"Save passing rollouts: {args.passing_rollouts_output}")
+    if args.save_all_rollouts:
+        logger.info(f"Save all rollouts: {args.passing_rollouts_output}")
     logger.info("="*60 + "\n")
+
+    # Start timing
+    start_time = time.time()
 
     # Run evaluation
     eval_results = evaluate(
@@ -872,6 +1067,20 @@ def main():
             output_dir=pass_rate_dir,
         )
 
+    # Save rollouts if requested
+    if args.save_passing_rollouts:
+        write_passing_rollouts(
+            samples=eval_results["samples"],
+            per_sample_results=eval_results["per_sample_results"],
+            output_file=args.passing_rollouts_output,
+        )
+    elif args.save_all_rollouts:
+        write_all_rollouts(
+            samples=eval_results["samples"],
+            per_sample_results=eval_results["per_sample_results"],
+            output_file=args.passing_rollouts_output,
+        )
+
     # Save detailed results if requested
     if args.output:
         output_path = Path(args.output)
@@ -879,6 +1088,28 @@ def main():
         with open(output_path, 'w') as f:
             json.dump(eval_results, f, indent=2)
         logger.info(f"Detailed results saved to {output_path}")
+
+    # Calculate and print total time taken
+    total_time = time.time() - start_time
+
+    print("\n" + "="*50)
+    print("TIME SUMMARY")
+    print("="*50)
+    print(f"Total time: {total_time:.2f}s")
+
+    # Print per-attempt times if available
+    if "attempt_times" in eval_results and eval_results["attempt_times"]:
+        print("\nPer-attempt times:")
+        attempt_times = eval_results["attempt_times"]
+        attempt_p90_times = eval_results.get("attempt_p90_times", [])
+
+        for i, attempt_time in enumerate(attempt_times):
+            if i < len(attempt_p90_times) and attempt_p90_times[i] > 0:
+                print(f"  Attempt {i + 1}: {attempt_time:.2f}s (P90: {attempt_p90_times[i]:.2f}s)")
+            else:
+                print(f"  Attempt {i + 1}: {attempt_time:.2f}s")
+
+    print("="*50 + "\n")
 
 
 if __name__ == "__main__":
