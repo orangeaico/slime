@@ -210,7 +210,7 @@ class AsyncRolloutWorker:
         logger.info("Continuous async rollout worker started")
 
         active_tasks = set()
-        max_concurrent_tasks = self.args.rollout_batch_size
+        max_concurrent_tasks = 48
         group_id_counter = 0
 
         while self.running:

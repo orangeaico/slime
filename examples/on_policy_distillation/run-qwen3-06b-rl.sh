@@ -192,6 +192,7 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.8
    --partial-rollout
    --sglang-enable-fp32-lm-head
+   --enable-rollout-grouped-n
 )
 
 

@@ -110,7 +110,7 @@ ROLLOUT_ARGS=(
    --rollout-top-p 0.8
    --rollout-top-k 20
    --use-rollout-logprobs
-   --pipeline-rl-k 2
+   --pipeline-rl-k 8
    --rollout-sample-filter-path slime.rollout.filter_hub.sample_filters.mark_truncated_samples_inactive
    --rollout-function-path examples.fully_async.fully_async_rollout.generate_rollout_fully_async
 
@@ -150,9 +150,9 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --micro-batch-size 4
-   # --use-dynamic-batch-size
-   --max-tokens-per-gpu $MAX_SEQ_LEN
+   # --micro-batch-size 4
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 32736
 )
 
 GRPO_ARGS=(
@@ -194,7 +194,7 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.8
    --partial-rollout
    --sglang-enable-fp32-lm-head
-   --sglang-server-concurrency ${SGLANG_SERVER_CONCURRENCY:-300}
+   --enable-rollout-grouped-n
 )
 
 
@@ -202,10 +202,10 @@ MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --attention-backend flash
-   # --fused-linear-cross-entropy
+   --fused-linear-cross-entropy
    --cross-entropy-loss-fusion
    --cross-entropy-fusion-impl te
-   --fp32-lm-head
+   # --fp32-lm-head
    --bf16
    --use-distributed-optimizer
    --use-precision-aware-optimizer
