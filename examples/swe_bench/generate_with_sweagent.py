@@ -354,7 +354,6 @@ class SlimeLLMModel(AbstractModel):
             "model": self.sglang_model_name,
             "messages": messages,
             "temperature": getattr(self.config, "temperature", 0.7),
-            "max_tokens": 4096,
             "top_p": getattr(self.config, "top_p", 1.0),
         }
 
@@ -1197,7 +1196,7 @@ async def generate(args, sample: Sample, sampling_params) -> Sample:
 
         # 12. Extract final patch
         logger.info(f"[Slime-SWE] Extracting final patch...")
-        patch = info.get("submission", "") if isinstance(info, dict) else ""
+        patch = str(info.get("submission", "") if isinstance(info, dict) else "")
 
         sample.metadata["patch"] = patch
         logger.info(

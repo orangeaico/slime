@@ -192,12 +192,16 @@ class UpdateWeightFromDistributed(UpdateWeight):
         self._is_src_rank = dist.get_rank() == 0
         if self._is_src_rank:
             self._group_name = "slime"
-            master_address = ray._private.services.get_node_ip_address()
+            master_address = ray.util.get_node_ip_address()
             with socket.socket() as sock:
                 sock.bind(("", 0))
                 master_port = sock.getsockname()[1]
             ## TODO: why +1?
             world_size = self.args.rollout_num_gpus + 1
+            logger.info(
+                "Init distributed weight update group: "
+                f"master_address={master_address}, master_port={master_port}, world_size={world_size}"
+            )
 
             refs = [
                 engine.init_weights_update_group.remote(

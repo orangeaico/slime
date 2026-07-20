@@ -352,7 +352,11 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
     data = []
     completed_groups = {}
     do_print = True
+    pipeline_rl_k = getattr(args, "pipeline_rl_k", None)
     stale_drop_groups = 0
+    trainer_step_snapshot = worker.get_latest_trainer_step() if pipeline_rl_k is not None else None
+    if pipeline_rl_k is not None:
+        logger.info(f"PipelineRL trainer_step snapshot for rollout {rollout_id}: {trainer_step_snapshot}")
 
     logger.info(f"Starting async rollout collection for {target_data_size} groups")
     logger.info(f"Global worker queue size: {worker.get_queue_size()}")
@@ -390,9 +394,8 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
                 break
 
             generation_step, group = completed_groups.pop(group_id)
-            pipeline_rl_k = getattr(args, "pipeline_rl_k", None)
             if pipeline_rl_k is not None and generation_step is not None:
-                trainer_step = worker.get_latest_trainer_step()
+                trainer_step = trainer_step_snapshot
                 group_lag = max(0, int(trainer_step) - int(generation_step))
                 if group_lag > int(pipeline_rl_k):
                     stale_drop_groups += 1
@@ -488,7 +491,7 @@ async def generate_rollout_async(args, rollout_id: int, data_buffer) -> list[lis
         _collect_stale_metrics(
             stale_drop_groups=stale_drop_groups,
         )
-        if getattr(args, "pipeline_rl_k", None) is not None
+        if pipeline_rl_k is not None
         else {}
     )
     return RolloutFnTrainOutput(samples=data, metrics=metric_gatherer.collect() | worker_metrics | stale_metrics)

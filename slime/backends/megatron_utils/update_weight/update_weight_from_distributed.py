@@ -1,3 +1,4 @@
+import logging
 import socket
 import time
 from argparse import Namespace
@@ -15,6 +16,8 @@ from slime.utils.distributed_utils import get_gloo_group, init_process_group
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
+
+logger = logging.getLogger(__name__)
 
 
 class UpdateWeightFromDistributed:
@@ -247,11 +250,16 @@ def connect_rollout_engines_from_distributed(
     """
     Create NCCL group: training rank 0 + all engine GPUs. Blocks until joined.
     """
-    master_address = ray._private.services.get_node_ip_address()
+    master_address = ray.util.get_node_ip_address()
     with socket.socket() as sock:
         sock.bind(("", 0))
         master_port = sock.getsockname()[1]
     world_size = len(rollout_engines) * args.rollout_num_gpus_per_engine + 1
+    logger.info(
+        "Connect rollout engines for distributed update: "
+        f"master_address={master_address}, master_port={master_port}, world_size={world_size}, "
+        f"num_rollout_engines={len(rollout_engines)}"
+    )
 
     refs = [
         engine.init_weights_update_group.remote(

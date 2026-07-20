@@ -39,6 +39,64 @@ def sort_key(x):
     return (node_ip_parts, gpu_id)
 
 
+def _apply_node_preferences(
+    bundle_indices: list[int],
+    gpu_ids: list[int],
+    node_ids: list[str],
+    *,
+    training_slots: int,
+):
+    actor_node_ip = os.environ.get("SLIME_ACTOR_NODE_IP")
+    rollout_node_ip = os.environ.get("SLIME_ROLLOUT_NODE_IP")
+
+    if not actor_node_ip and not rollout_node_ip:
+        return bundle_indices, gpu_ids, node_ids
+
+    entries = list(zip(bundle_indices, gpu_ids, node_ids, strict=True))
+
+    if training_slots < 0 or training_slots > len(entries):
+        raise RuntimeError(
+            f"Invalid training_slots={training_slots} for total bundles={len(entries)} while applying node preferences."
+        )
+
+    rollout_slots = len(entries) - training_slots
+
+    def _pick_by_node(source_entries, target_node, count, role_name):
+        if count == 0:
+            return [], source_entries
+        if target_node is None:
+            return source_entries[:count], source_entries[count:]
+
+        picked = [e for e in source_entries if e[2] == target_node][:count]
+        if len(picked) < count:
+            node_hist = {}
+            for _, _, node in source_entries:
+                node_hist[node] = node_hist.get(node, 0) + 1
+            raise RuntimeError(
+                f"Not enough placement-group bundles on {role_name} node '{target_node}'. "
+                f"Need {count}, found {len(picked)}. Available bundle distribution: {node_hist}. "
+                "Check Ray worker GPU resources and node IP env vars."
+            )
+        picked_set = set(picked)
+        rest = [e for e in source_entries if e not in picked_set]
+        return picked, rest
+
+    training_entries, remaining_entries = _pick_by_node(entries, actor_node_ip, training_slots, "actor")
+    rollout_entries, tail_entries = _pick_by_node(remaining_entries, rollout_node_ip, rollout_slots, "rollout")
+    final_entries = training_entries + rollout_entries + tail_entries
+
+    logger.info(
+        "Applied node preference for placement groups: "
+        f"SLIME_ACTOR_NODE_IP={actor_node_ip}, SLIME_ROLLOUT_NODE_IP={rollout_node_ip}, "
+        f"training_slots={training_slots}, rollout_slots={rollout_slots}"
+    )
+
+    new_bundle_indices = [x[0] for x in final_entries]
+    new_gpu_ids = [x[1] for x in final_entries]
+    new_node_ids = [x[2] for x in final_entries]
+    return new_bundle_indices, new_gpu_ids, new_node_ids
+
+
 def _create_placement_group(num_gpus):
     """Create a placement group with the specified number of GPUs."""
     bundles = [{"GPU": 1, "CPU": 1} for _ in range(num_gpus)]
@@ -66,6 +124,7 @@ def _create_placement_group(num_gpus):
     pg_reordered_bundle_indices = [info[0] for info in sorted_bundle_infos]
     # Map from logical index -> physical GPU ID
     pg_reordered_gpu_ids = [gpu_ids[info[0]][1] for info in sorted_bundle_infos]
+    pg_reordered_node_ids = [gpu_ids[info[0]][0] for info in sorted_bundle_infos]
 
     for i in range(num_bundles):
         actual_bundle_index = pg_reordered_bundle_indices[i]
@@ -74,7 +133,7 @@ def _create_placement_group(num_gpus):
             f"node: {gpu_ids[actual_bundle_index][0]}, gpu: {gpu_ids[actual_bundle_index][1]}"
         )
 
-    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids
+    return pg, pg_reordered_bundle_indices, pg_reordered_gpu_ids, pg_reordered_node_ids
 
 
 def create_placement_groups(args):
@@ -105,7 +164,25 @@ def create_placement_groups(args):
             rollout_offset += args.critic_num_nodes * args.critic_num_gpus_per_node
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
-    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
+    pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids, actor_pg_reordered_node_ids = (
+        _create_placement_group(num_gpus)
+    )
+
+    training_slots = rollout_offset
+    actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids, actor_pg_reordered_node_ids = (
+        _apply_node_preferences(
+            actor_pg_reordered_bundle_indices,
+            actor_pg_reordered_gpu_ids,
+            actor_pg_reordered_node_ids,
+            training_slots=training_slots,
+        )
+    )
+
+    for i in range(len(actor_pg_reordered_bundle_indices)):
+        logger.info(
+            f"  logical bundle {i:4}, actual_bundle_index: {actor_pg_reordered_bundle_indices[i]:4}, "
+            f"node: {actor_pg_reordered_node_ids[i]}, gpu: {actor_pg_reordered_gpu_ids[i]}"
+        )
 
     rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
     rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]

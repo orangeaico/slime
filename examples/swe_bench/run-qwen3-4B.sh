@@ -96,7 +96,7 @@ fi
 echo "HAS_NVLINK: $HAS_NVLINK (detected $NVLINK_COUNT NVLink references)"
 
 source "/root/repo/slime/.env"
-source "/root/repo/slime/scripts/models/qwen3-4B-Instruct-2507.sh"
+source "/root/repo/slime/scripts/models/qwen3-0.6B.sh"
 
 TIMESTAMP=$(date +"%Y_%m_%d_%H_%M_%S")
 if [ -z "${RAY_HEAD_PORT:-}" ]; then
@@ -124,7 +124,7 @@ SWE_EVAL_REWARD_ENABLE=${SWE_EVAL_REWARD_ENABLE:-0}
 # SWE_EVAL_PYTEST_TIMEOUT_SECONDS=${SWE_EVAL_PYTEST_TIMEOUT_SECONDS:-180}
 
 
-# SWE_HARDCODED_RESPONSE_MODE=${SWE_HARDCODED_RESPONSE_MODE:-program}
+SWE_HARDCODED_RESPONSE_MODE=${SWE_HARDCODED_RESPONSE_MODE:-none}
 # SWE_HARDCODED_PROGRAM_PATH=${SWE_HARDCODED_PROGRAM_PATH:-/root/repo/slime/examples/swe_bench/hardcoded_programs/hardcoded_program_eval_patch.yaml}
 
 
@@ -288,6 +288,8 @@ DEBUG_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
+SLIME_HOST_IP=${SLIME_HOST_IP:-${MASTER_ADDR}}
+echo "Using SLIME_HOST_IP=${SLIME_HOST_IP} for rollout router host advertisement"
 ray start --head --node-ip-address ${MASTER_ADDR} --port ${RAY_HEAD_PORT} --num-gpus ${RAY_HEAD_NUM_GPUS} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=${RAY_DASHBOARD_PORT} --temp-dir ${RAY_TEMP_DIR}
 
 RUNTIME_ENV_JSON=$(cat <<EOF
@@ -295,6 +297,7 @@ RUNTIME_ENV_JSON=$(cat <<EOF
   "env_vars": {
     "PYTHONPATH": "/root/Megatron-LM/:/root/swe_livup",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "SLIME_HOST_IP": "${SLIME_HOST_IP}",
     "SWE_AGENT_CONFIG_ROOT": "/root/swe_livup",
     "SWE_AGENT_CACHE_ROOT": "/root/repo/slime/outputs/swe_agent_cache",
     "SWE_AGENT_TRAJECTORY_DIR": "/root/repo/slime/outputs/swe_agent_trajectories",

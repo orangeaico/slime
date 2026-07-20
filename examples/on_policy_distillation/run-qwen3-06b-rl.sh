@@ -2,6 +2,15 @@
 
 # usage: bash examples/on_policy_distillation/run-qwen3-8B-opd.sh
 
+RAY_GCS_PORT=${RAY_GCS_PORT:-6378}
+RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT:-5265}
+RAY_CLIENT_PORT=${RAY_CLIENT_PORT:-10001}
+RAY_TEMP_DIR=${RAY_TEMP_DIR:-/tmp/ray-slime-06b}
+RAY_DASHBOARD_AGENT_LISTEN_PORT=${RAY_DASHBOARD_AGENT_LISTEN_PORT:-52375}
+RAY_DASHBOARD_AGENT_GRPC_PORT=${RAY_DASHBOARD_AGENT_GRPC_PORT:-53272}
+RAY_RUNTIME_ENV_AGENT_PORT=${RAY_RUNTIME_ENV_AGENT_PORT:-64561}
+RAY_METRICS_EXPORT_PORT=${RAY_METRICS_EXPORT_PORT:-64699}
+
 ####clear before training
 pkill -9 sglang
 sleep 3
@@ -11,6 +20,9 @@ pkill -9 python
 sleep 3
 pkill -9 ray
 pkill -9 python
+ray stop --force || true
+pkill -9 ray redis gcs_server raylet plasma_store || true
+rm -rf /tmp/ray "${RAY_TEMP_DIR}"
 
 set -ex
 
@@ -34,7 +46,7 @@ MODEL_NAME=Qwen3-0.6B
 
 MAX_SEQ_LEN=1024
 APF_THRESHOLD=${APF_THRESHOLD:-0.875}
-APF_WINDOW_STEPS=${APF_WINDOW_STEPS:-1}
+APF_WINDOW_STEPS=${APF_WINDOW_STEPS:-2}
 APF_DROP_PROB=${APF_DROP_PROB:-0.75}
 LENGTH_PENALTY_TYPE=${LENGTH_PENALTY_TYPE:-dapo_style}
 LENGTH_PENALTY_CACHE_LEN=${LENGTH_PENALTY_CACHE_LEN:-$(((MAX_SEQ_LEN + 6) / 7))}
@@ -67,7 +79,7 @@ else
       --eps-clip-high 0.28
    )
 fi
-   
+
 CKPT_ARGS=(
    --hf-checkpoint /root/data/hf_models/$MODEL_NAME
    --ref-load /root/data/mega-models/$MODEL_NAME
@@ -93,7 +105,7 @@ ROLLOUT_ARGS=(
    --reward-key score
 
    --num-rollout 702
-   --max-fresh-prompt-passes 3
+   --max-fresh-prompt-passes 4
    --rollout-batch-size 32
    --num-steps-per-rollout 4
    --over-sampling-batch-size 48
@@ -110,7 +122,8 @@ ROLLOUT_ARGS=(
    --rollout-top-p 0.8
    --rollout-top-k 20
    --use-rollout-logprobs
-# --rollout-sample-filter-path slime.rollout.filter_hub.sample_filters.mark_truncated_samples_inactive
+   --rollout-sample-filter-path slime.rollout.filter_hub.sample_filters.mark_truncated_samples_inactive
+   --rollout-function-path examples.fully_async.fully_async_rollout.generate_rollout_fully_async
 
    --global-batch-size 64
    --balance-data
@@ -122,7 +135,7 @@ RM_ARGS=(
    --rollout-all-samples-process-path slime.rollout.scalerl.update_step_window_adaptive_prompt_filter
 )
 
-EVAL_ARGS=(   
+EVAL_ARGS=(
    --eval-interval 29
    --eval-prompt-data gsm8k /root/data/datasets/gsm8k/test_100.jsonl
    --n-samples-per-eval-prompt 4   
@@ -156,7 +169,7 @@ PERF_ARGS=(
 GRPO_ARGS=(
    --advantage-estimator grpo
    ${LOSS_ARGS[@]}
---group-relative-focal-gamma 0.5
+   --group-relative-focal-gamma 0.5
    --batch-level-normalization
    --prompt-level-loss-aggregation
    --kl-loss-coef 0.00
@@ -181,17 +194,18 @@ OPTIMIZER_ARGS=(
 )
 
 WANDB_ARGS=(
-   # --use-wandb
-   # --wandb-project slime-rl
-   # --wandb-group qwen3-06B-gsm
-   # --wandb-key ${WANDB_KEY}
+   --use-wandb
+   --wandb-project slime-rl
+   --wandb-group qwen3-06B-gsm
+   --wandb-key $WANDB_KEY
 )
 
 SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 2
+   --rollout-num-gpus-per-engine 1
    --sglang-mem-fraction-static 0.8
    --partial-rollout
    --sglang-enable-fp32-lm-head
+   --sglang-server-concurrency ${SGLANG_SERVER_CONCURRENCY:-300}
 )
 
 
@@ -199,7 +213,7 @@ MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --attention-backend flash
-# --fused-linear-cross-entropy
+   # --fused-linear-cross-entropy
    --cross-entropy-loss-fusion
    --cross-entropy-fusion-impl te
    --fp32-lm-head
@@ -220,10 +234,21 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head \
+   --node-ip-address ${MASTER_ADDR} \
+   --num-gpus 2 \
+   --disable-usage-stats \
+   --port ${RAY_GCS_PORT} \
+   --dashboard-host=0.0.0.0 \
+   --dashboard-port=${RAY_DASHBOARD_PORT} \
+   --dashboard-agent-listen-port=${RAY_DASHBOARD_AGENT_LISTEN_PORT} \
+   --dashboard-agent-grpc-port=${RAY_DASHBOARD_AGENT_GRPC_PORT} \
+   --runtime-env-agent-port=${RAY_RUNTIME_ENV_AGENT_PORT} \
+   --metrics-export-port=${RAY_METRICS_EXPORT_PORT} \
+   --ray-client-server-port=${RAY_CLIENT_PORT} \
+   --temp-dir ${RAY_TEMP_DIR}
 
-
-ray job submit --address="http://127.0.0.1:8265" \
+ray job submit --address="http://127.0.0.1:${RAY_DASHBOARD_PORT}" \
    --runtime-env-json='{
      "env_vars": {
         "PYTHONPATH": "/root/Megatron-LM/",
@@ -258,3 +283,6 @@ pkill -9 python
 sleep 3
 pkill -9 ray
 pkill -9 python
+ray stop --force || true
+pkill -9 ray redis gcs_server raylet plasma_store || true
+rm -rf /tmp/ray "${RAY_TEMP_DIR}"

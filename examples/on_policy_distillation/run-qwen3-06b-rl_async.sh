@@ -150,9 +150,9 @@ PERF_ARGS=(
    --recompute-method uniform
    --recompute-num-layers 1
 
-   --micro-batch-size 4
-   # --use-dynamic-batch-size
-   --max-tokens-per-gpu $MAX_SEQ_LEN
+   # --micro-batch-size 4
+   --use-dynamic-batch-size
+   --max-tokens-per-gpu 32736
 )
 
 GRPO_ARGS=(
@@ -194,18 +194,28 @@ SGLANG_ARGS=(
    --sglang-mem-fraction-static 0.8
    --partial-rollout
    --sglang-enable-fp32-lm-head
-   --sglang-server-concurrency ${SGLANG_SERVER_CONCURRENCY:-300}
+   # --sglang-fp8-gemm-backend cutlass
+   # --sglang-kv-cache-dtype fp8_e4m3
+   # --sglang-enable-torch-compile
+   # --sglang-cuda-graph-max-bs 512
+   --sglang-server-concurrency 160
 )
+
+# Disable CB for test
+SGLANG_ARGS+=(
+  --router-disable-circuit-breaker
+)
+
 
 
 MISC_ARGS=(
    --attention-dropout 0.0
    --hidden-dropout 0.0
    --attention-backend flash
-   # --fused-linear-cross-entropy
+   --fused-linear-cross-entropy
    --cross-entropy-loss-fusion
    --cross-entropy-fusion-impl te
-   --fp32-lm-head
+   # --fp32-lm-head
    --bf16
    --use-distributed-optimizer
    --use-precision-aware-optimizer
@@ -223,14 +233,34 @@ MISC_ARGS=(
 
 # launch the master node of ray in container
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 2 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+export SLIME_HOST_IP=${SLIME_HOST_IP:-${MASTER_ADDR}}
+export SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER=${SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER:-1}
+export SLIME_ROLLOUT_NODE_IP=${SLIME_ROLLOUT_NODE_IP:-""}
+export SLIME_ACTOR_NODE_IP=${SLIME_ACTOR_NODE_IP:-""}
+export SLIME_SOCKET_IFNAME=${SLIME_SOCKET_IFNAME:-tailscale0}
+export NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:-${SLIME_SOCKET_IFNAME}}
+export GLOO_SOCKET_IFNAME=${GLOO_SOCKET_IFNAME:-${SLIME_SOCKET_IFNAME}}
+ray start --head --node-ip-address ${MASTER_ADDR} --port 26001 --num-gpus ${RAY_HEAD_NUM_GPUS:-2} --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+
+RUNTIME_ENV_JSON=$(
+  cat <<EOF
+{
+  "env_vars": {
+    "PYTHONPATH": "/root/Megatron-LM/",
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
+    "SLIME_HOST_IP": "${SLIME_HOST_IP}",
+    "SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER": "${SLIME_PIN_ROLLOUT_MANAGER_TO_DRIVER}",
+    "SLIME_ROLLOUT_NODE_IP": "${SLIME_ROLLOUT_NODE_IP}",
+    "SLIME_ACTOR_NODE_IP": "${SLIME_ACTOR_NODE_IP}",
+    "NCCL_SOCKET_IFNAME": "${NCCL_SOCKET_IFNAME}",
+    "GLOO_SOCKET_IFNAME": "${GLOO_SOCKET_IFNAME}"
+  }
+}
+EOF
+)
+
 ray job submit --address="http://127.0.0.1:8265" \
-   --runtime-env-json='{
-     "env_vars": {
-        "PYTHONPATH": "/root/Megatron-LM/",
-        "CUDA_DEVICE_MAX_CONNECTIONS": "1"
-     }
-   }' \
+   --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 train_async.py \
    --actor-num-nodes 1 \
    --actor-num-gpus-per-node 1 \

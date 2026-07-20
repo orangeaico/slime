@@ -66,6 +66,13 @@ PROMPT_PREFIX = "Solve the following math problem step by step. The last line of
 PROMPT_SUFFIX = "\n\nRemember to put your answer on its own line after \"Answer:\"."
 
 
+def compute_tps(num_tokens: int, elapsed_sec: float) -> float:
+    """Compute tokens per second safely."""
+    if elapsed_sec <= 0:
+        return 0.0
+    return num_tokens / elapsed_sec
+
+
 def add_prompt_wrapper(content: str) -> str:
     """Add prefix and suffix to prompt if they don't already exist."""
     # Check if prefix already exists
@@ -155,7 +162,7 @@ def generate_response(
     do_sample: bool = True,
     sample_idx: int = 0,
     add_wrapper: bool = False,
-) -> str:
+) -> tuple[str, int, int, float, float]:
     """Generate a response from the model."""
     logger.info(f"[Sample {sample_idx}] Preparing prompt...")
 
@@ -184,7 +191,7 @@ def generate_response(
     logger.info(f"[Sample {sample_idx}] Input tokens: {input_length}, Generating up to {max_new_tokens} new tokens...")
 
     # Generate
-    start_time = time.time()
+    start_time = time.perf_counter()
     with torch.no_grad():
         outputs = model.generate(
             inputs,
@@ -193,18 +200,19 @@ def generate_response(
             do_sample=do_sample,
             pad_token_id=tokenizer.eos_token_id,
         )
-    gen_time = time.time() - start_time
+    gen_time = time.perf_counter() - start_time
 
     output_length = outputs.shape[1]
     generated_tokens = output_length - input_length
-    logger.info(f"[Sample {sample_idx}] Generated {generated_tokens} tokens in {gen_time:.2f}s ({generated_tokens/gen_time:.1f} tokens/s)")
+    output_tps = compute_tps(generated_tokens, gen_time)
+    logger.info(f"[Sample {sample_idx}] Generated {generated_tokens} tokens in {gen_time:.2f}s ({output_tps:.1f} tokens/s)")
 
     # Decode only the generated part (excluding the prompt)
     response = tokenizer.decode(outputs[0][inputs.shape[1]:], skip_special_tokens=True)
     logger.info(f"[Sample {sample_idx}] Response length: {len(response)} chars")
     logger.info(f"[Sample {sample_idx}] Response preview: {response[:100]}...")
 
-    return response, input_length, generated_tokens
+    return response, input_length, generated_tokens, gen_time, output_tps
 
 
 def generate_response_vllm(
@@ -215,7 +223,7 @@ def generate_response_vllm(
     temperature: float = 0.7,
     sample_idx: int = 0,
     add_wrapper: bool = False,
-) -> str:
+) -> tuple[str, int, int, float, float]:
     """Generate a response using vLLM server API."""
     logger.info(f"[Sample {sample_idx}] Preparing vLLM API request...")
 
@@ -264,7 +272,7 @@ def generate_response_vllm(
     logger.info(f"[Sample {sample_idx}] Model: {model_name}, max_tokens: {max_new_tokens}, temperature: {temperature}")
 
     # Send request
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
         response = requests.post(url, json=payload, headers={"Content-Type": "application/json"})
         response.raise_for_status()
@@ -273,7 +281,7 @@ def generate_response_vllm(
         logger.error(f"[Sample {sample_idx}] vLLM API request failed: {e}")
         raise
 
-    gen_time = time.time() - start_time
+    gen_time = time.perf_counter() - start_time
 
     # Extract response text
     if "choices" in response_data and len(response_data["choices"]) > 0:
@@ -290,16 +298,17 @@ def generate_response_vllm(
 
             input_tokens = prompt_tokens
             output_tokens = completion_tokens
-
-            logger.info(f"[Sample {sample_idx}] Generated {completion_tokens} tokens in {gen_time:.2f}s ({completion_tokens/gen_time:.1f} tokens/s)")
+            output_tps = compute_tps(completion_tokens, gen_time)
+            logger.info(f"[Sample {sample_idx}] Generated {completion_tokens} tokens in {gen_time:.2f}s ({output_tps:.1f} tokens/s)")
             logger.info(f"[Sample {sample_idx}] Total tokens used: {total_tokens}")
         else:
+            output_tps = compute_tps(output_tokens, gen_time)
             logger.info(f"[Sample {sample_idx}] Request completed in {gen_time:.2f}s")
 
         logger.info(f"[Sample {sample_idx}] Response length: {len(response_text)} chars")
         logger.info(f"[Sample {sample_idx}] Response preview: {response_text[:100]}...")
 
-        return response_text, input_tokens, output_tokens
+        return response_text, input_tokens, output_tokens, gen_time, output_tps
     else:
         raise ValueError(f"Unexpected response format from vLLM API: {response_data}")
 
@@ -325,7 +334,7 @@ def process_single_sample(
 
     try:
         if use_vllm:
-            response, input_tokens, output_tokens = generate_response_vllm(
+            response, input_tokens, output_tokens, gen_time, output_tps = generate_response_vllm(
                 prompt=prompt,
                 port=vllm_port,
                 model_name=vllm_model_name,
@@ -335,7 +344,7 @@ def process_single_sample(
                 add_wrapper=add_wrapper,
             )
         else:
-            response, input_tokens, output_tokens = generate_response(
+            response, input_tokens, output_tokens, gen_time, output_tps = generate_response(
                 model, tokenizer, prompt,
                 max_new_tokens=max_new_tokens,
                 temperature=temperature,
@@ -363,6 +372,8 @@ def process_single_sample(
             "correct": is_correct,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
+            "time_taken_sec": gen_time,
+            "output_tokens_per_second": output_tps,
         }
         return result
 
@@ -378,6 +389,8 @@ def process_single_sample(
             "correct": False,
             "input_tokens": 0,
             "output_tokens": 0,
+            "time_taken_sec": 0.0,
+            "output_tokens_per_second": 0.0,
         }
 
 
@@ -403,6 +416,8 @@ def write_attempt_results_file(
                 "correct": result.get("correct"),
                 "input_tokens": result.get("input_tokens"),
                 "output_tokens": result.get("output_tokens"),
+                "time_taken_sec": result.get("time_taken_sec"),
+                "output_tokens_per_second": result.get("output_tokens_per_second"),
             }
             if "error" in result:
                 record["error"] = result["error"]
@@ -492,6 +507,7 @@ def evaluate(
     logger.info("="*60)
 
     # Run evaluation for multiple attempts
+    evaluation_start_time = time.perf_counter()
     for attempt_num in range(attempts):
         logger.info(f"\n{'='*60}")
         logger.info(f"ATTEMPT {attempt_num + 1}/{attempts}")
@@ -583,6 +599,8 @@ def evaluate(
     total_output_tokens = sum(r.get("output_tokens", 0) for r in all_results)
     avg_input_tokens = total_input_tokens / len(all_results) if all_results else 0
     avg_output_tokens = total_output_tokens / len(all_results) if all_results else 0
+    evaluation_wall_time_sec = time.perf_counter() - evaluation_start_time
+    evaluation_output_tps = compute_tps(total_output_tokens, evaluation_wall_time_sec)
 
     logger.info("\n" + "="*60)
     logger.info("Evaluation Complete!")
@@ -596,6 +614,8 @@ def evaluate(
     logger.info(f"Average output tokens: {avg_output_tokens:.1f}")
     logger.info(f"Total input tokens: {total_input_tokens}")
     logger.info(f"Total output tokens: {total_output_tokens}")
+    logger.info(f"Evaluation wall time: {evaluation_wall_time_sec:.2f}s")
+    logger.info(f"Evaluation output TPS: {evaluation_output_tps:.2f}")
     logger.info("="*60)
 
     summary = {
@@ -609,6 +629,8 @@ def evaluate(
         "avg_output_tokens": avg_output_tokens,
         "total_input_tokens": total_input_tokens,
         "total_output_tokens": total_output_tokens,
+        "evaluation_wall_time_sec": evaluation_wall_time_sec,
+        "evaluation_output_tps": evaluation_output_tps,
         "mode": "vllm" if use_vllm else "huggingface",
         "model_path": model_path if not use_vllm else f"vllm://{vllm_model_name}",
         "dataset_path": dataset_path,
@@ -849,7 +871,13 @@ def main():
     for key, value in eval_results["summary"].items():
         if key in ["pass_at_k_percentage", "overall_accuracy_percentage"]:
             print(f"{key:25s}: {value:.2f}%")
-        elif key in ["avg_input_tokens", "avg_output_tokens", "avg_at_k"]:
+        elif key in [
+            "avg_input_tokens",
+            "avg_output_tokens",
+            "avg_at_k",
+            "evaluation_wall_time_sec",
+            "evaluation_output_tps",
+        ]:
             print(f"{key:25s}: {value:.2f}")
         elif key in ["total_input_tokens", "total_output_tokens"]:
             print(f"{key:25s}: {value}")

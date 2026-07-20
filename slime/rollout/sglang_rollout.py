@@ -297,6 +297,11 @@ async def generate_and_rm_group(
 
     # for the rm that need the whole group, we will do the rm here
     if not state.aborted and args.group_rm:
+        # Skip group-level RM when any sample is aborted.
+        # Aborted groups are handled by the rollout loop (e.g. requeued in fully-async mode),
+        # and running RM on invalid/partial samples can trigger avoidable teacher HTTP 400 errors.
+        if any(sample.status == Sample.Status.ABORTED for sample in group):
+            return group
         rewards = await batched_async_rm(args, group)
         for sample, reward in zip(group, rewards, strict=False):
             sample.reward = reward
